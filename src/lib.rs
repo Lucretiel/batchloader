@@ -1,7 +1,6 @@
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+//mod dataloader
+mod batchloader;
+mod batchstate;
+mod data;
+
+pub use data::{KeySet, ValueSet};
