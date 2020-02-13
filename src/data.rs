@@ -43,6 +43,18 @@ pub struct KeySet<Key> {
 }
 
 impl<Key> KeySet<Key> {
+    pub(crate) fn discard_token(&mut self, token: Token) {
+        match self.tokens.entry(token) {
+            Entry::Occupied(entry) if *entry.get() == 0 => {
+                entry.remove();
+            }
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() -= 1;
+            }
+            Entry::Vacant(_) => panic!("Attempted to remove nonexistent token from KeySet"),
+        }
+    }
+
     /// Check if there are any keys in this keyset
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -117,18 +129,15 @@ impl<Key: Hash + Eq> KeySet<Key> {
     /// key. This token can then be used to pull a value out of the ValueSet
     /// associated with the key.
     pub(crate) fn add_key(&mut self, key: Key) -> Token {
-        let new_token = Token(self.keys.len());
+        let new_token = Token(NonZeroUsize::new(self.keys.len() + 1).unwrap());
         let token = self.keys.entry(key).or_insert(new_token).duplicate();
         self.tokens
             .entry(token.duplicate())
             .and_modify(|count| *count += 1)
             .or_insert(0);
 
-        token.duplicate()
+        token
     }
-
-    /// TODO: add a function to discard a token. Need a way to associate
-    /// Tokens backwards with keys.
 
     /// Take the keyset out of this particular &mut self instance, replacing it
     /// with an empty set. Helper method for when the state transitions out
@@ -160,9 +169,20 @@ pub struct ValueSet<Value> {
 }
 
 impl<Value> ValueSet<Value> {
-    pub(crate) fn new_empty() -> Self {
-        Self {
-            values: HashMap::new(),
+    /// Discard a token associated with this ValueSet without getting the
+    /// value. No-op if the token isn't present.
+    pub(crate) fn discard(&mut self, token: Token) {
+        // TODO: Replace this with RawEntry
+        match self.values.entry(token) {
+            Entry::Vacant(..) => {}
+            Entry::Occupied(mut entry) => match entry.get_mut() {
+                &mut (_, 0) => {
+                    entry.remove();
+                }
+                (_value, count) => {
+                    *count -= 1;
+                }
+            },
         }
     }
 }
@@ -184,23 +204,6 @@ impl<Value: Clone> ValueSet<Value> {
                 (value, count) => {
                     *count -= 1;
                     Some(value.clone())
-                }
-            },
-        }
-    }
-
-    /// Discard a token associated with this ValueSet without getting the
-    /// value. No-op if the token isn't present.
-    pub(crate) fn discard(&mut self, token: Token) {
-        // TODO: Replace this with RawEntry
-        match self.values.entry(token) {
-            Entry::Vacant(..) => {}
-            Entry::Occupied(mut entry) => match entry.get_mut() {
-                &mut (_, 0) => {
-                    entry.remove();
-                }
-                (value, count) => {
-                    *count -= 1;
                 }
             },
         }
