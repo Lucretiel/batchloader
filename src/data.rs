@@ -7,9 +7,11 @@ use std::collections::hash_map::{Entry, HashMap};
 use std::fmt::{self, Debug, Formatter};
 use std::hash::Hash;
 use std::mem;
+use std::num::NonZeroUsize;
 
+#[repr(transparent)]
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Token(usize);
+pub(crate) struct Token(NonZeroUsize);
 
 impl Token {
     fn duplicate(&self) -> Self {
