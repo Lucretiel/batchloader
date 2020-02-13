@@ -4,7 +4,6 @@
 // ValueSet
 
 use std::collections::hash_map::{Entry, HashMap};
-use std::fmt::{self, Debug, Formatter};
 use std::hash::Hash;
 use std::mem;
 use std::num::NonZeroUsize;
@@ -24,7 +23,8 @@ impl Token {
 /// execute your request. Then, use the `into_key_values` function to
 /// transform your response data into a ValueSet, which is handed back to the
 /// batch loader.
-pub struct KeySet<Key> {
+#[derive(Debug)]
+pub struct KeySet<Key: Eq + Hash> {
     // In order to not require cloneable keys, this structure associates each
     // key with two pieces of information:
     //
@@ -42,7 +42,7 @@ pub struct KeySet<Key> {
     tokens: HashMap<Token, usize>,
 }
 
-impl<Key> KeySet<Key> {
+impl<Key: Eq + Hash> KeySet<Key> {
     pub(crate) fn discard_token(&mut self, token: Token) {
         match self.tokens.entry(token) {
             Entry::Occupied(entry) if *entry.get() == 0 => {
@@ -101,7 +101,7 @@ impl<Key> KeySet<Key> {
     ) -> Result<ValueSet<Value>, Error> {
         let KeySet { keys, tokens } = self;
 
-        let result: Result<HashMap<Token, (Value, usize)>, Error> = keys
+        let result: Result<HashMap<Token, ValueSetEntry<Value>>, Error> = keys
             .into_iter()
             .filter_map(move |(key, token)| {
                 let count = tokens.get(&token)?;
@@ -109,15 +109,13 @@ impl<Key> KeySet<Key> {
             })
             .map(move |(key, token, count)| {
                 let value = get_value(&key)?;
-                Ok((token, (value, count)))
+                Ok((token, ValueSetEntry { value, count }))
             })
             .collect();
 
         result.map(move |values| ValueSet { values })
     }
-}
 
-impl<Key: Hash + Eq> KeySet<Key> {
     pub(crate) fn new() -> Self {
         Self {
             keys: HashMap::new(),
@@ -151,13 +149,10 @@ impl<Key: Hash + Eq> KeySet<Key> {
     }
 }
 
-impl<Key: Debug + Hash + Eq> Debug for KeySet<Key> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KeySet")
-            .field("keys", &self.keys)
-            .field("tokens", &self.tokens)
-            .finish()
-    }
+#[derive(Debug)]
+struct ValueSetEntry<Value> {
+    count: usize,
+    value: Value,
 }
 
 /// A value set is an opaque data structure that contains the result of a batch
@@ -165,7 +160,7 @@ impl<Key: Debug + Hash + Eq> Debug for KeySet<Key> {
 /// Batcher to distribute the values to the correct waiting futures.
 #[derive(Debug)]
 pub struct ValueSet<Value> {
-    values: HashMap<Token, (Value, usize)>,
+    values: HashMap<Token, ValueSetEntry<Value>>,
 }
 
 impl<Value> ValueSet<Value> {
@@ -175,20 +170,18 @@ impl<Value> ValueSet<Value> {
         // TODO: Replace this with RawEntry
         match self.values.entry(token) {
             Entry::Vacant(..) => {}
-            Entry::Occupied(mut entry) => match entry.get_mut() {
-                &mut (_, 0) => {
-                    entry.remove();
-                }
-                (_value, count) => {
-                    *count -= 1;
-                }
-            },
+            Entry::Occupied(entry) if entry.get().count == 0 => {
+                entry.remove();
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().count -= 1;
+            }
         }
     }
 }
 
 impl<Value: Clone> ValueSet<Value> {
-    // TODO: deduplicate these methods.
+    // TODO: deduplicate take and discard
 
     /// Take a value assoicated with a token out of this ValueSet. If the
     /// count of this token is > 0, the value is cloned.
@@ -199,13 +192,12 @@ impl<Value: Clone> ValueSet<Value> {
         // TODO: Replace this with RawEntry
         match self.values.entry(token) {
             Entry::Vacant(..) => None,
-            Entry::Occupied(mut entry) => match entry.get_mut() {
-                &mut (_, 0) => Some(entry.remove().0),
-                (value, count) => {
-                    *count -= 1;
-                    Some(value.clone())
-                }
-            },
+            Entry::Occupied(entry) if entry.get().count == 0 => Some(entry.remove().value),
+            Entry::Occupied(mut entry) => {
+                let entry = entry.get_mut();
+                entry.count -= 1;
+                Some(entry.value.clone())
+            }
         }
     }
 }

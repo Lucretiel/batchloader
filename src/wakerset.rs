@@ -1,7 +1,7 @@
-use std::{collections::HashMap, task::Waker};
+use std::{collections::HashMap, default::Default, num::NonZeroUsize, task::Waker};
 
 #[derive(Debug, Eq, PartialEq, Hash)]
-pub(crate) struct Token(usize);
+pub(crate) struct Token(NonZeroUsize);
 
 impl Token {
     fn duplicate(&self) -> Token {
@@ -9,10 +9,19 @@ impl Token {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct WakerSet {
     wakers: HashMap<Token, Waker>,
-    next_token: usize,
+    next_token: NonZeroUsize,
+}
+
+impl Default for WakerSet {
+    fn default() -> Self {
+        Self {
+            wakers: HashMap::with_capacity(1),
+            next_token: NonZeroUsize::new(1).unwrap(),
+        }
+    }
 }
 
 impl WakerSet {
@@ -23,7 +32,7 @@ impl WakerSet {
     #[must_use]
     pub(crate) fn add_waker(&mut self, waker: Waker) -> Token {
         let token = Token(self.next_token);
-        self.next_token += 1;
+        self.next_token = NonZeroUsize::new(self.next_token.get() + 1).unwrap();
 
         self.wakers.insert(token.duplicate(), waker);
         token

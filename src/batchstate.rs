@@ -1,7 +1,9 @@
 use std::{
+    fmt::{self, Debug, Formatter},
     future::Future,
     hash::Hash,
     mem,
+    num::NonZeroUsize,
     pin::Pin,
     sync::Mutex,
     sync::{Arc, Weak},
@@ -17,11 +19,22 @@ use crate::{
     wakerset::{Token as WakerToken, WakerSet},
 };
 
-struct AccumulatingState<Key, Batcher> {
+struct AccumulatingState<Key: Eq + Hash, Batcher> {
     keys: KeySet<Key>,
     batcher: Batcher,
     delay: Delay,
     wakers: WakerSet,
+}
+
+impl<Key: Debug + Hash + Eq, Batcher> Debug for AccumulatingState<Key, Batcher> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccumulatingState")
+            .field("keys", &self.keys)
+            .field("batcher", &"<closure>")
+            .field("delay", &self.delay)
+            .field("wakers", &self.wakers)
+            .finish()
+    }
 }
 
 // Design notes:
@@ -31,30 +44,53 @@ struct AccumulatingState<Key, Batcher> {
 // - If a future is dropped, we need to arrange for a different task to
 //   continue driving this batch
 // - When the batch completes, we need to wake ALL the tasks
+#[derive(Debug)]
 struct RunningState<Fut> {
     fut: Fut,
     wakers: WakerSet,
     dropped_tokens: Vec<KeyToken>,
 }
 
-enum State<Key, Value, Error, Fut, Batcher> {
+enum State<Key: Hash + Eq, Value, Error, Fut, Batcher> {
     Accum(AccumulatingState<Key, Batcher>),
     Running(RunningState<Fut>),
     Done(Result<ValueSet<Value>, Error>),
 }
 
-pub struct BatchController<Key, Value, Error, Fut, Batcher> {
+pub struct BatchController<Key: Hash + Eq, Value, Error, Fut, Batcher> {
     batcher: Batcher,
     window: Duration,
-    max_keys: usize,
+    max_keys: Option<NonZeroUsize>,
     state: Mutex<Weak<Mutex<State<Key, Value, Error, Fut, Batcher>>>>,
 }
 
 impl<Key, Value, Error, Fut, Batcher> BatchController<Key, Value, Error, Fut, Batcher>
 where
     Key: Eq + Hash,
-    Batcher: Clone,
+    Value: Clone,
+    Error: Clone,
+    Fut: Future<Output = Result<ValueSet<Value>, Error>>,
+    Batcher: Clone + Fn(KeySet<Key>) -> Fut,
 {
+    pub fn new(max_keys: Option<usize>, window: Duration, batcher: Batcher) -> Self {
+        let max_keys = max_keys.map(|max| {
+            if max < 2 {
+                panic!("Max keys for a BatchController must be at least 2");
+            }
+
+            // We could use unsafe new_unchecked here, but why bother when the
+            // compiler will fix it anyway
+            NonZeroUsize::new(max).unwrap()
+        });
+
+        Self {
+            batcher,
+            window,
+            max_keys,
+            state: Mutex::new(Weak::new()),
+        }
+    }
+
     pub fn load(&self, key: Key) -> BatchFuture<Key, Value, Error, Fut, Batcher> {
         let mut guard = self.state.lock().unwrap();
 
@@ -69,14 +105,13 @@ where
                 // If we've hit the key limit, reset the timer so that the
                 // batch is issued immediately, then detach the shared state
                 // from the controller.
-                if state.keys.len() >= self.max_keys {
-                    state.delay.reset(Duration::from_secs(0));
-                    drop(state_guard);
-                    *guard = Weak::new();
-                } else {
-                    // We need to manually drop the state_guard in order to
-                    // be able to pass the state_handle into the BatchFuture
-                    drop(state_guard);
+                match self.max_keys {
+                    Some(max_keys) if state.keys.len() >= max_keys.get() => {
+                        state.delay.reset(Duration::from_secs(0));
+                        drop(state_guard);
+                        *guard = Weak::new();
+                    }
+                    _ => drop(state_guard),
                 }
 
                 return BatchFuture {
@@ -111,7 +146,7 @@ where
 // makes our implementation simpler but is unnecessary overhead.
 // Invariant: in order for this future to exist, its key must have been added
 // to the state.
-pub struct BatchFuture<Key, Value, Error, Fut, Batcher> {
+pub struct BatchFuture<Key: Hash + Eq, Value, Error, Fut, Batcher> {
     key_token: Option<KeyToken>,
     waker_token: Option<WakerToken>,
     state: Arc<Mutex<State<Key, Value, Error, Fut, Batcher>>>,
@@ -210,7 +245,9 @@ where
     }
 }
 
-impl<Key, Value, Error, Fut, Batcher> Drop for BatchFuture<Key, Value, Error, Fut, Batcher> {
+impl<Key: Hash + Eq, Value, Error, Fut, Batcher> Drop
+    for BatchFuture<Key, Value, Error, Fut, Batcher>
+{
     fn drop(&mut self) {
         // An important thing to remember when dropping a BatchFuture:
         // the shared futures used by a collection of BatchFutures are only
@@ -263,3 +300,6 @@ impl<Key, Value, Error, Fut, Batcher> Drop for BatchFuture<Key, Value, Error, Fu
         }
     }
 }
+
+// TODO: Make BatchFuture cloneable. This requires making tokens cloneable,
+// which isn't the worst thing, but it does break our ownership model a bit.
