@@ -70,6 +70,9 @@ pub struct BatchController<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay, De
     rules: BatchRules<Batcher, Delayer>,
 
     // TODO: find a good way to rewrite this type so that this lint passes
+    // TODO: use arc_swap instead of Mutex<Arc>. The inner mutex should ensure
+    // that we can respect our invariants, so it seems like it's mostly a
+    // matter of a retry loop?
     #[allow(clippy::type_complexity)]
     state: Mutex<Weak<Mutex<State<Key, Value, Error, Fut, Batcher, Delay>>>>,
 }
@@ -96,8 +99,9 @@ where
         let mut guard = self.state.lock().unwrap();
 
         // If there is an existing state, and it's still in the accum state,
-        // add a new key to it. Note that at no point do we check the timing
-
+        // add a new key to it. Note that at no point do we check the timing;
+        // we assume that if our delay window has closed, a future poll will
+        // advance the state to Running.
         if let Some(state_handle) = guard.upgrade() {
             let mut state_guard = state_handle.lock().unwrap();
             if let State::Accum(ref mut state) = *state_guard {
@@ -169,6 +173,7 @@ where
     type Output = Result<Value, Error>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
+        // TODO: panic safety when resolving / polling batcher and delayer
         // TODO: find a way to make all of this into an async function. The major friction points
         // are:
         //
