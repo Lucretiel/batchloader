@@ -110,18 +110,7 @@ where
                 match self.rules.max_keys {
                     Some(max_keys) if state.keys.len() >= max_keys.get() => {
                         state.delay = None;
-                        // Note: currently we explicitly choose not to do a wake
-                        // here. This is because `load` is about to return a
-                        // future, and we assume that either the future is about
-                        // to be polled, or it will be dropped. In the latter
-                        // case it will then wake a random other future in our
-                        // wakerset.
-                        //
-                        // In the event that this implementation changes to
-                        // explicitly track the "driving" future, to reduce
-                        // spurious wakeups under certain drop orderings,
-                        // we will have to add a wakers.wake_any() call in
-                        // here.
+                        state.wakers.wake_driver();
                         drop(state_guard);
                         *guard = Weak::new();
                     }
@@ -257,19 +246,16 @@ where
                     .for_each(move |token| values.discard(token));
             }
 
-            let mut all_wakers = mem::take(&mut state.wakers);
-
-            // We're about to grab our result, so we don't need to wake
-            // ourself. It's also entirely possible that we never had a token
-            // to begin with
-            if let Some(waker_token) = unpinned.waker_token.take() {
-                // Don't use discard_and_wake because we're about to wake_all
-                all_wakers.discard_waker(waker_token);
-            }
-
             // Now that we have a result, signal all the waiting futures to
             // wake up so they can get their results.
-            all_wakers.wake_all();
+            let all_wakers = mem::take(&mut state.wakers);
+            match unpinned.waker_token.take() {
+                // We're about to grab our result, so we don't need to wake
+                // ourself. It's also entirely possible that we never had a token
+                // to begin with.
+                Some(token) => all_wakers.discard_wake_all(token),
+                None => all_wakers.wake_all(),
+            }
 
             // Cleanup is all done; transition the state.
             // Safety note: this is where the future is destructed in place,
@@ -298,16 +284,11 @@ impl<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
         // the shared futures used by a collection of BatchFutures are only
         // ever being driven by a single future. Therefore, we have to ensure
         // that another task is awoken to "take over", in case this one was
-        // the driver. We store all the wakers of the associated futures, so
-        // that the
+        // the driver. This logic is mostly handled by the WakerSet type.
         let mut guard = self.state.lock().unwrap();
 
-        // TODO: right now, we unconditionally wake another future when we
-        // drop. We should track if we're known to be the "active" future
-        // to prevent spurious wakeups.
         match *guard {
             State::Accum(ref mut state) => {
-                // Deregister ourselves from the KeySet and WakerSet.
                 if let Some(waker_token) = self.waker_token.take() {
                     // discard_and_wake ensures that if we were the driving
                     // future, another future will be selected to progress the
@@ -320,7 +301,6 @@ impl<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
                 }
             }
             State::Running(ref mut state) => {
-                // Deregister ourselves from the WakerSet.
                 if let Some(waker_token) = self.waker_token.take() {
                     // discard_and_wake ensures that if we were the driving
                     // future, another future will be selected to progress the
