@@ -1,8 +1,6 @@
-//mod dataloader
-//mod batchloader;
-mod batchstate;
+mod batch;
 mod data;
 mod wakerset;
 
-pub use batchstate::{BatchController, BatchFuture, BatchRules};
+pub use batch::{BatchController, BatchFuture, BatchRules};
 pub use data::{KeySet, ValueSet};

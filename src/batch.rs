@@ -80,10 +80,10 @@ where
     Key: Eq + Hash,
     Value: Clone,
     Error: Clone,
-    Fut: Future<Output = Result<ValueSet<Value>, Error>>,
-    Batcher: Clone + Fn(KeySet<Key>) -> Fut,
-    Delay: Future<Output = ()>,
     Delayer: Fn() -> Delay,
+    Delay: Future<Output = ()>,
+    Batcher: Clone + Fn(KeySet<Key>) -> Fut,
+    Fut: Future<Output = Result<ValueSet<Value>, Error>>,
 {
     pub fn new(rules: BatchRules<Batcher, Delayer>) -> Self {
         Self {
@@ -162,9 +162,9 @@ where
     Key: Eq + Hash,
     Value: Clone,
     Error: Clone,
-    Fut: Future<Output = Result<ValueSet<Value>, Error>>,
-    Batcher: Clone + Fn(KeySet<Key>) -> Fut,
     Delay: Future<Output = ()>,
+    Batcher: Clone + Fn(KeySet<Key>) -> Fut,
+    Fut: Future<Output = Result<ValueSet<Value>, Error>>,
 {
     type Output = Result<Value, Error>;
 
@@ -185,6 +185,8 @@ where
                 // Safety: the delay is inside an arc and we don't pull it out.
                 // It is destructed in-place at the end of this block if the
                 // delay doesn't return Pending.
+                // TODO: We can probably use a utility library like pin-project
+                // to get rid of these unsafes
                 let pinned_delay = unsafe { Pin::new_unchecked(delay) };
                 if let Poll::Pending = pinned_delay.poll(ctx) {
                     // This waker is now the driving waker for the Delay
