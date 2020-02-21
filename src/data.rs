@@ -3,10 +3,12 @@
 // to enforce that each token can be used for at-most one extraction from a
 // ValueSet
 
-use std::collections::hash_map::{Entry, HashMap};
-use std::hash::Hash;
-use std::mem;
-use std::num::NonZeroUsize;
+use std::{
+    collections::hash_map::{Entry, HashMap},
+    hash::Hash,
+    mem,
+    num::NonZeroUsize,
+};
 
 #[repr(transparent)]
 #[derive(Debug, PartialEq, Eq, Hash)]

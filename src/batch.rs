@@ -18,8 +18,6 @@ use crate::{
 struct AccumulatingState<Key: Eq + Hash, Batcher, Delay> {
     keys: KeySet<Key>,
     batcher: Batcher,
-    // If None, we're trying to force an immediate start (duration == 0).
-    // TODO: Change this away from an Option if futures-timer#56 is resolved.
     delay: Option<Delay>,
     wakers: WakerSet,
 }
@@ -190,8 +188,6 @@ where
                 // Safety: the delay is inside an arc and we don't pull it out.
                 // It is destructed in-place at the end of this block if the
                 // delay doesn't return Pending.
-                // TODO: We can probably use a utility library like pin-project
-                // to get rid of these unsafes
                 let pinned_delay = unsafe { Pin::new_unchecked(delay) };
                 if let Poll::Pending = pinned_delay.poll(ctx) {
                     // This waker is now the driving waker for the Delay
@@ -292,44 +288,57 @@ impl<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
         // ever being driven by a single future. Therefore, we have to ensure
         // that another task is awoken to "take over", in case this one was
         // the driver. This logic is mostly handled by the WakerSet type.
-        let mut guard = self.state.lock().unwrap();
 
-        match *guard {
-            State::Accum(ref mut state) => {
-                if let Some(waker_token) = self.waker_token.take() {
-                    // discard_and_wake ensures that if we were the driving
-                    // future, another future will be selected to progress the
-                    // shared batch job.
-                    state.wakers.discard_and_wake(waker_token);
-                }
+        // Currently, we don't do any cleanup if the mutex is poisoned. The
+        // main issue here is that we don't propogate our WakerSet state
+        // correctly; if the driving future panicks while being polled, none
+        // of the other futures will be notified. There are a few ways to
+        // address this:
+        // - in the short term, add an extra case here for cleanup if the
+        //   mutex is panicked that simply awakens all the tasks (so that they
+        //   will propogate the panics)
+        // - in the medium term, add a "panicked" state and prevent the
+        //   mutex from being poisoned in the first place
+        // - in the long term, move to partially lockless implementation (see
+        //   futures::Shared)
+        if let Ok(mut guard) = self.state.lock() {
+            match *guard {
+                State::Accum(ref mut state) => {
+                    if let Some(waker_token) = self.waker_token.take() {
+                        // discard_and_wake ensures that if we were the driving
+                        // future, another future will be selected to progress the
+                        // shared batch job.
+                        state.wakers.discard_and_wake(waker_token);
+                    }
 
-                if let Some(key_token) = self.key_token.take() {
-                    state.keys.discard_token(key_token);
+                    if let Some(key_token) = self.key_token.take() {
+                        state.keys.discard_token(key_token);
+                    }
                 }
-            }
-            State::Running(ref mut state) => {
-                if let Some(waker_token) = self.waker_token.take() {
-                    // discard_and_wake ensures that if we were the driving
-                    // future, another future will be selected to progress the
-                    // shared batch job.
-                    state.wakers.discard_and_wake(waker_token);
-                }
+                State::Running(ref mut state) => {
+                    if let Some(waker_token) = self.waker_token.take() {
+                        // discard_and_wake ensures that if we were the driving
+                        // future, another future will be selected to progress the
+                        // shared batch job.
+                        state.wakers.discard_and_wake(waker_token);
+                    }
 
-                // We're in the running state, which means that the KeySet is
-                // frozen (owned by the executing future). Add our token to
-                // the list of dropped tokens so that it can be discared from
-                // the ValueSet when it's ready.
-                if let Some(key_token) = self.key_token.take() {
-                    state.dropped_tokens.push(key_token)
+                    // We're in the running state, which means that the KeySet is
+                    // frozen (owned by the executing future). Add our token to
+                    // the list of dropped tokens so that it can be discared from
+                    // the ValueSet when it's ready.
+                    if let Some(key_token) = self.key_token.take() {
+                        state.dropped_tokens.push(key_token)
+                    }
                 }
-            }
-            State::Done(Ok(ref mut values)) => {
-                // Drop our token from the ValueSet
-                if let Some(key_token) = self.key_token.take() {
-                    values.discard(key_token);
+                State::Done(Ok(ref mut values)) => {
+                    // Drop our token from the ValueSet
+                    if let Some(key_token) = self.key_token.take() {
+                        values.discard(key_token);
+                    }
                 }
+                State::Done(Err(..)) => {}
             }
-            State::Done(Err(..)) => {}
         }
     }
 }

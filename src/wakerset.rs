@@ -40,6 +40,7 @@ pub(crate) struct WakerSet {
     // working. Additionally, if there is a series of drops in a row without
     // an intervening poll, we must ensure that at the end of a drop chain,
     // a non-dropped future has been awakened (or the WakerSet is empty)
+    // TODO: Replace HashMap with Slab
     wakers: HashMap<Token, Waker>,
     driving_waker: Option<Token>,
 
