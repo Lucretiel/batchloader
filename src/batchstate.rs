@@ -8,19 +8,14 @@ use std::{
     sync::Mutex,
     sync::{Arc, Weak},
     task::{Context, Poll},
-    time::Duration,
 };
-
-use futures_timer::Delay;
 
 use crate::{
     data::{KeySet, Token as KeyToken, ValueSet},
     wakerset::{Token as WakerToken, WakerSet},
 };
 
-const ZERO_SECS: Duration = Duration::from_secs(0);
-
-struct AccumulatingState<Key: Eq + Hash, Batcher> {
+struct AccumulatingState<Key: Eq + Hash, Batcher, Delay> {
     keys: KeySet<Key>,
     batcher: Batcher,
     // If None, we're trying to force an immediate start (duration == 0).
@@ -29,7 +24,11 @@ struct AccumulatingState<Key: Eq + Hash, Batcher> {
     wakers: WakerSet,
 }
 
-impl<Key: Debug + Hash + Eq, Batcher> Debug for AccumulatingState<Key, Batcher> {
+impl<Key, Batcher, Delay> Debug for AccumulatingState<Key, Batcher, Delay>
+where
+    Key: Debug + Hash + Eq,
+    Delay: Debug,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("AccumulatingState")
             .field("keys", &self.keys)
@@ -54,43 +53,46 @@ struct RunningState<Fut> {
     dropped_tokens: Vec<KeyToken>,
 }
 
-enum State<Key: Hash + Eq, Value, Error, Fut, Batcher> {
-    Accum(AccumulatingState<Key, Batcher>),
+enum State<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> {
+    Accum(AccumulatingState<Key, Batcher, Delay>),
     Running(RunningState<Fut>),
     Done(Result<ValueSet<Value>, Error>),
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BatchRules<Batcher> {
+pub struct BatchRules<Batcher, Delayer> {
     pub batcher: Batcher,
-    pub window: Duration,
+    pub window: Delayer,
     pub max_keys: Option<NonZeroUsize>,
 }
 
-pub struct BatchController<Key: Hash + Eq, Value, Error, Fut, Batcher> {
-    rules: BatchRules<Batcher>,
+pub struct BatchController<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay, Delayer> {
+    rules: BatchRules<Batcher, Delayer>,
 
     // TODO: find a good way to rewrite this type so that this lint passes
     #[allow(clippy::type_complexity)]
-    state: Mutex<Weak<Mutex<State<Key, Value, Error, Fut, Batcher>>>>,
+    state: Mutex<Weak<Mutex<State<Key, Value, Error, Fut, Batcher, Delay>>>>,
 }
 
-impl<'a, Key, Value, Error, Fut, Batcher> BatchController<Key, Value, Error, Fut, Batcher>
+impl<'a, Key, Value, Error, Fut, Batcher, Delay, Delayer>
+    BatchController<Key, Value, Error, Fut, Batcher, Delay, Delayer>
 where
     Key: Eq + Hash,
     Value: Clone,
     Error: Clone,
     Fut: Future<Output = Result<ValueSet<Value>, Error>>,
     Batcher: Clone + Fn(KeySet<Key>) -> Fut,
+    Delay: Future<Output = ()>,
+    Delayer: Fn() -> Delay,
 {
-    pub fn new(rules: BatchRules<Batcher>) -> Self {
+    pub fn new(rules: BatchRules<Batcher, Delayer>) -> Self {
         Self {
             rules,
             state: Mutex::new(Weak::new()),
         }
     }
 
-    pub fn load(&self, key: Key) -> BatchFuture<Key, Value, Error, Fut, Batcher> {
+    pub fn load(&self, key: Key) -> BatchFuture<Key, Value, Error, Fut, Batcher, Delay> {
         let mut guard = self.state.lock().unwrap();
 
         // If there is an existing state, and it's still in the accum state,
@@ -140,11 +142,7 @@ where
         let state = Arc::new(Mutex::new(State::Accum(AccumulatingState {
             keys,
             batcher: self.rules.batcher.clone(),
-            delay: if self.rules.window == ZERO_SECS {
-                None
-            } else {
-                Some(Delay::new(self.rules.window))
-            },
+            delay: Some((self.rules.window)()),
             wakers: WakerSet::default(),
         })));
 
@@ -160,22 +158,24 @@ where
 
 // Invariant: in order for this future to exist, its key must have been added
 // to the state.
-pub struct BatchFuture<Key: Hash + Eq, Value, Error, Fut, Batcher> {
+pub struct BatchFuture<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> {
     key_token: Option<KeyToken>,
     waker_token: Option<WakerToken>,
 
     // TODO: find a good way to rewrite this type so that this lint passes
     #[allow(clippy::type_complexity)]
-    state: Arc<Mutex<State<Key, Value, Error, Fut, Batcher>>>,
+    state: Arc<Mutex<State<Key, Value, Error, Fut, Batcher, Delay>>>,
 }
 
-impl<Key, Value, Error, Fut, Batcher> Future for BatchFuture<Key, Value, Error, Fut, Batcher>
+impl<Key, Value, Error, Fut, Batcher, Delay> Future
+    for BatchFuture<Key, Value, Error, Fut, Batcher, Delay>
 where
     Key: Eq + Hash,
     Value: Clone,
     Error: Clone,
     Fut: Future<Output = Result<ValueSet<Value>, Error>>,
     Batcher: Clone + Fn(KeySet<Key>) -> Fut,
+    Delay: Future<Output = ()>,
 {
     type Output = Result<Value, Error>;
 
@@ -195,7 +195,11 @@ where
 
             // Check the delay
             if let Some(ref mut delay) = state.delay {
-                if let Poll::Pending = Pin::new(delay).poll(ctx) {
+                // Safety: the delay is inside an arc and we don't pull it out.
+                // It is destructed in-place at the end of this block if the
+                // delay doesn't return Pending.
+                let pinned_delay = unsafe { Pin::new_unchecked(delay) };
+                if let Poll::Pending = pinned_delay.poll(ctx) {
                     return Poll::Pending;
                 }
             }
@@ -206,6 +210,8 @@ where
 
             let fut = (state.batcher)(keyset);
 
+            // Safety note: this is where the delay is destructed in place,
+            // ensuring the pin contract is upheld.
             *guard = State::Running(RunningState {
                 fut,
                 wakers,
@@ -252,7 +258,9 @@ where
 
             all_wakers.wake_all();
 
-            // Cleanup is all done; transition the state
+            // Cleanup is all done; transition the state.
+            // Safety note: this is where the future is destructed in place,
+            // ensuring the pin contract is upheld.
             *guard = State::Done(result);
         }
 
@@ -269,8 +277,8 @@ where
     }
 }
 
-impl<Key: Hash + Eq, Value, Error, Fut, Batcher> Drop
-    for BatchFuture<Key, Value, Error, Fut, Batcher>
+impl<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
+    for BatchFuture<Key, Value, Error, Fut, Batcher, Delay>
 {
     fn drop(&mut self) {
         // An important thing to remember when dropping a BatchFuture:

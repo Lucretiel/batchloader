@@ -1,7 +1,8 @@
+//! These tests ensure that dropped futures correctly update the shared state
 use batchloader::{BatchController, BatchRules, KeySet, ValueSet};
 use cooked_waker::{IntoWaker, Wake, WakeRef};
-use futures::executor;
-/// These tests ensure that dropped futures correctly update the shared state
+use futures::{executor, future};
+use futures_timer::Delay;
 use std::{
     future::Future,
     hash::Hash,
@@ -34,7 +35,7 @@ async fn put_keys_in_rc<T: Copy + Eq + Hash>(keys: KeySet<T>) -> Result<ValueSet
 fn test_simple_drop_after_resolution() {
     let controller = BatchController::new(BatchRules {
         batcher: put_keys_in_rc,
-        window: Duration::from_secs(0),
+        window: || future::ready(()),
         max_keys: None,
     });
 
@@ -65,7 +66,8 @@ fn test_simple_drop_after_resolution() {
 
 #[test]
 fn test_drop_during_delay() {
-    // This controller asserts that precisely the keys 1 and 2
+    // This controller asserts that precisely the keys 1 and 2 are present in
+    // the
     let controller = BatchController::new(BatchRules {
         batcher: |keys: KeySet<i32>| async {
             assert_eq!(keys.len(), 2);
@@ -82,7 +84,7 @@ fn test_drop_during_delay() {
                 Ok(keys.into_values(|key| *key))
             }
         },
-        window: Duration::from_secs(1),
+        window: || Delay::new(Duration::from_millis(10)),
         max_keys: None,
     });
 
@@ -95,8 +97,8 @@ fn test_drop_during_delay() {
     let fut2 = controller.load(2);
     let fut3 = controller.load(3);
 
-    // This poll initiates the delay. We'll drop futures in this phase
-    // and
+    // This poll initiates the delay. We'll drop futures in this phase, then
+    // confirm that the dropped keys weren't in the batched set.
     let poll = Pin::new(&mut fut1).poll(&mut ctx);
     assert_eq!(poll, Poll::Pending);
 

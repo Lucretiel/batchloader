@@ -3,8 +3,9 @@
 
 use batchloader::{BatchController, BatchRules, KeySet};
 use cooked_waker::{IntoWaker, Wake, WakeRef};
-use futures::FutureExt;
+use futures::{channel::oneshot, FutureExt};
 use std::{
+    cell::Cell,
     collections::HashMap,
     future::Future,
     pin::Pin,
@@ -13,8 +14,6 @@ use std::{
         Arc,
     },
     task::{Context, Poll, Waker},
-    thread::sleep,
-    time::Duration,
 };
 
 /// A waker that stores true if it has been awoken
@@ -104,9 +103,16 @@ impl<F: Future + Unpin> Task<F> {
 
 #[test]
 fn test_notify_lifecycle() {
+    let delay_trigger = Cell::new(None);
+
     let controller = BatchController::new(BatchRules {
-        window: Duration::from_millis(1),
         max_keys: None,
+        window: || {
+            let (trigger, fut) = oneshot::channel();
+            let old = delay_trigger.replace(Some(trigger));
+            assert!(old.is_none());
+            fut.map(|_| ())
+        },
         batcher: |keys: KeySet<i32>| async {
             Skipper::new(1).await;
 
@@ -128,13 +134,13 @@ fn test_notify_lifecycle() {
     assert_eq!(task1.poll(), Poll::Pending);
 
     // At this pointer, the timer has started, and should still be running.
-    // None of the futures have been signaled. After 1 ms, signal1 (and ONLY
-    // signal 1) should have been signaled
+    // None of the futures have been signaled.
     assert!(!task1.is_signaled());
     assert!(!task2.is_signaled());
     assert!(!task3.is_signaled());
 
-    sleep(Duration::from_millis(10));
+    // Simulate a timer completion
+    delay_trigger.take().unwrap().send(()).unwrap();
 
     assert!(task1.is_signaled());
     assert!(!task2.is_signaled());
@@ -160,8 +166,15 @@ fn test_notify_lifecycle() {
 
 #[test]
 fn test_notify_lifecycle_drops() {
+    let delay_trigger = Cell::new(None);
+
     let controller = BatchController::new(BatchRules {
-        window: Duration::from_millis(1),
+        window: || {
+            let (trigger, fut) = oneshot::channel();
+            let old = delay_trigger.replace(Some(trigger));
+            assert!(old.is_none());
+            fut.map(|_| ())
+        },
         max_keys: None,
         batcher: |keys: KeySet<i32>| async {
             Skipper::new(1).await;
@@ -202,7 +215,8 @@ fn test_notify_lifecycle_drops() {
 
     let driving_task = driving_task.expect("Test failure: no task was awakened after a drop");
 
-    sleep(Duration::from_millis(10));
+    // Simulate a timer completion
+    delay_trigger.take().unwrap().send(()).unwrap();
 
     // At this point, the delay has finished, and the driving task should have
     // been signaled.

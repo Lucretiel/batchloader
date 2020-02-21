@@ -4,7 +4,8 @@
 use batchloader::{BatchController, BatchRules, KeySet, ValueSet};
 use cooked_waker::{IntoWaker, Wake, WakeRef};
 use crossbeam;
-use futures::{executor, FutureExt};
+use futures::{executor, future, FutureExt};
+use futures_timer::Delay;
 use std::{
     num::NonZeroUsize,
     sync::atomic::{AtomicUsize, Ordering},
@@ -33,7 +34,7 @@ fn simple_test() {
     let f = call_counter(&counter, stringify);
 
     let controller = BatchController::new(BatchRules {
-        window: Duration::from_secs(0),
+        window: move || future::ready(()),
         max_keys: None,
         batcher: f,
     });
@@ -55,7 +56,7 @@ fn low_key_test() {
     let f = call_counter(&counter, stringify);
 
     let controller = BatchController::new(BatchRules {
-        window: Duration::from_secs(0),
+        window: || future::ready(()),
         max_keys: NonZeroUsize::new(2),
         batcher: f,
     });
@@ -80,7 +81,7 @@ fn test_duplicate_keys() {
     let f = call_counter(&counter, stringify);
 
     let controller = BatchController::new(BatchRules {
-        window: Duration::from_secs(0),
+        window: || future::ready(()),
         max_keys: None,
         batcher: f,
     });
@@ -113,7 +114,7 @@ fn test_threaded() {
     let f = call_counter(&counter, stringify);
 
     let controller = BatchController::new(BatchRules {
-        window: Duration::from_millis(5),
+        window: || Delay::new(Duration::from_millis(10)),
         max_keys: None,
         batcher: f,
     });
@@ -124,7 +125,7 @@ fn test_threaded() {
         let threads: Vec<_> = (0..4)
             .map(move |i| {
                 s.spawn(move |_s| {
-                    thread::sleep(Duration::from_micros(((i + 10) * 10) + 10));
+                    thread::sleep(Duration::from_millis(i + 2));
                     let fut = controller_ref.load(i as usize);
                     let result = executor::block_on(fut);
                     result.unwrap()
@@ -157,7 +158,7 @@ impl Wake for NoOpWaker {
 fn test_key_limit_instant_trigger() {
     let controller = BatchController::new(BatchRules {
         batcher: |keys: KeySet<usize>| stringify(keys),
-        window: Duration::from_secs(36000),
+        window: || future::pending(),
         max_keys: NonZeroUsize::new(3),
     });
 
