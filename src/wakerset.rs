@@ -64,8 +64,8 @@ impl WakerSet {
             .into_iter()
             .for_each(|(_token, waker)| waker.wake());
     }
-
-    pub(crate) fn wake_all_by_ref(&self) {
-        self.wakers.values().for_each(|waker| waker.wake_by_ref());
-    }
 }
+
+// TODO: unit tests. Our integration tests pass so this is a low priority.
+// notify_tests.rs specifically tests that the functionality that wakerset
+// enables is being used correctly.

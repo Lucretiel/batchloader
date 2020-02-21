@@ -11,7 +11,6 @@ use std::{
     time::Duration,
 };
 
-use futures::{ready, FutureExt};
 use futures_timer::Delay;
 
 use crate::{
@@ -19,10 +18,14 @@ use crate::{
     wakerset::{Token as WakerToken, WakerSet},
 };
 
+const ZERO_SECS: Duration = Duration::from_secs(0);
+
 struct AccumulatingState<Key: Eq + Hash, Batcher> {
     keys: KeySet<Key>,
     batcher: Batcher,
-    delay: Delay,
+    // If None, we're trying to force an immediate start (duration == 0).
+    // TODO: Change this away from an Option if futures-timer#56 is resolved.
+    delay: Option<Delay>,
     wakers: WakerSet,
 }
 
@@ -57,14 +60,22 @@ enum State<Key: Hash + Eq, Value, Error, Fut, Batcher> {
     Done(Result<ValueSet<Value>, Error>),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BatchRules<Batcher> {
+    pub batcher: Batcher,
+    pub window: Duration,
+    pub max_keys: Option<NonZeroUsize>,
+}
+
 pub struct BatchController<Key: Hash + Eq, Value, Error, Fut, Batcher> {
-    batcher: Batcher,
-    window: Duration,
-    max_keys: Option<NonZeroUsize>,
+    rules: BatchRules<Batcher>,
+
+    // TODO: find a good way to rewrite this type so that this lint passes
+    #[allow(clippy::type_complexity)]
     state: Mutex<Weak<Mutex<State<Key, Value, Error, Fut, Batcher>>>>,
 }
 
-impl<Key, Value, Error, Fut, Batcher> BatchController<Key, Value, Error, Fut, Batcher>
+impl<'a, Key, Value, Error, Fut, Batcher> BatchController<Key, Value, Error, Fut, Batcher>
 where
     Key: Eq + Hash,
     Value: Clone,
@@ -72,21 +83,9 @@ where
     Fut: Future<Output = Result<ValueSet<Value>, Error>>,
     Batcher: Clone + Fn(KeySet<Key>) -> Fut,
 {
-    pub fn new(max_keys: Option<usize>, window: Duration, batcher: Batcher) -> Self {
-        let max_keys = max_keys.map(|max| {
-            if max < 2 {
-                panic!("Max keys for a BatchController must be at least 2");
-            }
-
-            // We could use unsafe new_unchecked here, but why bother when the
-            // compiler will fix it anyway
-            NonZeroUsize::new(max).unwrap()
-        });
-
+    pub fn new(rules: BatchRules<Batcher>) -> Self {
         Self {
-            batcher,
-            window,
-            max_keys,
+            rules,
             state: Mutex::new(Weak::new()),
         }
     }
@@ -102,12 +101,25 @@ where
             if let State::Accum(ref mut state) = *state_guard {
                 let key_token = state.keys.add_key(key);
 
-                // If we've hit the key limit, reset the timer so that the
-                // batch is issued immediately, then detach the shared state
-                // from the controller.
-                match self.max_keys {
+                // If we've hit the key limit:
+                // - Clear the timer
+                // - Initiate a poll
+                // - Detach the shared state from the controller
+                match self.rules.max_keys {
                     Some(max_keys) if state.keys.len() >= max_keys.get() => {
-                        state.delay.reset(Duration::from_secs(0));
+                        state.delay = None;
+                        // Note: currently we explicitly choose not to do a wake
+                        // here. This is because `load` is about to return a
+                        // future, and we assume that either the future is about
+                        // to be polled, or it will be dropped. In the latter
+                        // case it will then wake a random other future in our
+                        // wakerset.
+                        //
+                        // In the event that this implementation changes to
+                        // explicitly track the "driving" future, to reduce
+                        // spurious wakeups under certain drop orderings,
+                        // we will have to add a wakers.wake_any() call in
+                        // here.
                         drop(state_guard);
                         *guard = Weak::new();
                     }
@@ -127,8 +139,12 @@ where
 
         let state = Arc::new(Mutex::new(State::Accum(AccumulatingState {
             keys,
-            batcher: self.batcher.clone(),
-            delay: Delay::new(self.window),
+            batcher: self.rules.batcher.clone(),
+            delay: if self.rules.window == ZERO_SECS {
+                None
+            } else {
+                Some(Delay::new(self.rules.window))
+            },
             wakers: WakerSet::default(),
         })));
 
@@ -142,13 +158,14 @@ where
     }
 }
 
-// TODO: Ideally we can make this work with just a single Arc. Several arcs
-// makes our implementation simpler but is unnecessary overhead.
 // Invariant: in order for this future to exist, its key must have been added
 // to the state.
 pub struct BatchFuture<Key: Hash + Eq, Value, Error, Fut, Batcher> {
     key_token: Option<KeyToken>,
     waker_token: Option<WakerToken>,
+
+    // TODO: find a good way to rewrite this type so that this lint passes
+    #[allow(clippy::type_complexity)]
     state: Arc<Mutex<State<Key, Value, Error, Fut, Batcher>>>,
 }
 
@@ -158,7 +175,7 @@ where
     Value: Clone,
     Error: Clone,
     Fut: Future<Output = Result<ValueSet<Value>, Error>>,
-    Batcher: Fn(KeySet<Key>) -> Fut,
+    Batcher: Clone + Fn(KeySet<Key>) -> Fut,
 {
     type Output = Result<Value, Error>;
 
@@ -177,7 +194,11 @@ where
             }
 
             // Check the delay
-            ready!(state.delay.poll_unpin(ctx));
+            if let Some(ref mut delay) = state.delay {
+                if let Poll::Pending = Pin::new(delay).poll(ctx) {
+                    return Poll::Pending;
+                }
+            }
 
             // Delay is complete. Transition to the Running state.
             let wakers = mem::take(&mut state.wakers);
@@ -206,7 +227,10 @@ where
             // Safety: we don't ever move this reference, which is behind an
             // arc
             let fut = unsafe { Pin::new_unchecked(&mut state.fut) };
-            let mut result: Result<ValueSet<Value>, Error> = ready!(fut.poll(ctx));
+            let mut result = match fut.poll(ctx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result,
+            };
 
             // Some futures may have lost interest while we were in the Running
             // state. Remove those tokens from the ValueSet.
@@ -257,6 +281,9 @@ impl<Key: Hash + Eq, Value, Error, Fut, Batcher> Drop
         // that the
         let mut guard = self.state.lock().unwrap();
 
+        // TODO: right now, we unconditionally wake another future when we
+        // drop. We should track if we're known to be the "active" future
+        // to prevent spurious wakeups.
         match *guard {
             State::Accum(ref mut state) => {
                 // Deregister ourselves from the KeySet and WakerSet.
