@@ -180,19 +180,17 @@ where
     type Output = Result<Value, Error>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
+        // TODO: find a way to make all of this into an async function. The major friction points
+        // are:
+        //
+        // - Only one future needs to drive this to completion in the Accumulating and Running
+        //   states, but all futures need to be notified during the Done state
+        // - We need to "leak" the KeySet to the BatchController so that new futures can add
+        //   themselves to it. This is challenging if it lives in the stack of an async function.
         let unpinned = Pin::into_inner(self);
         let mut guard = unpinned.state.lock().unwrap();
 
         if let State::Accum(ref mut state) = *guard {
-            // Add this waker to the WakerSet
-            match unpinned.waker_token.as_ref() {
-                Some(token) => state.wakers.replace_waker(token, ctx.waker()),
-                None => {
-                    let token = state.wakers.add_waker(ctx.waker().clone());
-                    unpinned.waker_token = Some(token);
-                }
-            }
-
             // Check the delay
             if let Some(ref mut delay) = state.delay {
                 // Safety: the delay is inside an arc and we don't pull it out.
@@ -200,6 +198,15 @@ where
                 // delay doesn't return Pending.
                 let pinned_delay = unsafe { Pin::new_unchecked(delay) };
                 if let Poll::Pending = pinned_delay.poll(ctx) {
+                    // This waker is now the driving waker for the Delay
+                    // future. Update the wakerset.
+                    match unpinned.waker_token.as_ref() {
+                        Some(token) => state.wakers.replace_waker(token, ctx.waker()),
+                        None => {
+                            let token = state.wakers.add_waker(ctx.waker().clone());
+                            unpinned.waker_token = Some(token);
+                        }
+                    }
                     return Poll::Pending;
                 }
             }
@@ -220,21 +227,24 @@ where
         }
 
         if let State::Running(ref mut state) = *guard {
-            // Add this waker to the WakerSet
-            match unpinned.waker_token.as_ref() {
-                Some(token) => state.wakers.replace_waker(token, ctx.waker()),
-                None => {
-                    let token = state.wakers.add_waker(ctx.waker().clone());
-                    unpinned.waker_token = Some(token);
-                }
-            }
-
             // Check the future
             // Safety: we don't ever move this reference, which is behind an
             // arc
             let fut = unsafe { Pin::new_unchecked(&mut state.fut) };
             let mut result = match fut.poll(ctx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // This is now the driving waker for the batch future.
+                    // Update the wakerset.
+                    match unpinned.waker_token.as_ref() {
+                        Some(token) => state.wakers.replace_waker(token, ctx.waker()),
+                        None => {
+                            let token = state.wakers.add_waker(ctx.waker().clone());
+                            unpinned.waker_token = Some(token);
+                        }
+                    }
+
+                    return Poll::Pending;
+                }
                 Poll::Ready(result) => result,
             };
 
@@ -247,15 +257,18 @@ where
                     .for_each(move |token| values.discard(token));
             }
 
-            // Now that we have a result, signal all the waiting futures to
-            // wake up so they can get their results.
             let mut all_wakers = mem::take(&mut state.wakers);
+
+            // We're about to grab our result, so we don't need to wake
+            // ourself. It's also entirely possible that we never had a token
+            // to begin with
             if let Some(waker_token) = unpinned.waker_token.take() {
-                // We're about to grab our result, so we don't need to wake
-                // ourself
+                // Don't use discard_and_wake because we're about to wake_all
                 all_wakers.discard_waker(waker_token);
             }
 
+            // Now that we have a result, signal all the waiting futures to
+            // wake up so they can get their results.
             all_wakers.wake_all();
 
             // Cleanup is all done; transition the state.
@@ -295,26 +308,24 @@ impl<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
         match *guard {
             State::Accum(ref mut state) => {
                 // Deregister ourselves from the KeySet and WakerSet.
-                // Additionally, we might have been the "driving" future of
-                // the shared state, so wake up another task at random to keep
-                // progressing the state.
+                if let Some(waker_token) = self.waker_token.take() {
+                    // discard_and_wake ensures that if we were the driving
+                    // future, another future will be selected to progress the
+                    // shared batch job.
+                    state.wakers.discard_and_wake(waker_token);
+                }
+
                 if let Some(key_token) = self.key_token.take() {
                     state.keys.discard_token(key_token);
                 }
-
-                if let Some(waker_token) = self.waker_token.take() {
-                    state.wakers.discard_waker(waker_token);
-                    state.wakers.wake_any();
-                }
             }
             State::Running(ref mut state) => {
-                // Deregister ourselves from the WakerSet.  Additionally, we
-                // might have been the "driving" future of the shared state,
-                // so wake up another task at random to keep progressing the
-                // state.
+                // Deregister ourselves from the WakerSet.
                 if let Some(waker_token) = self.waker_token.take() {
-                    state.wakers.discard_waker(waker_token);
-                    state.wakers.wake_any();
+                    // discard_and_wake ensures that if we were the driving
+                    // future, another future will be selected to progress the
+                    // shared batch job.
+                    state.wakers.discard_and_wake(waker_token);
                 }
 
                 // We're in the running state, which means that the KeySet is
