@@ -1,13 +1,7 @@
 use std::{collections::HashMap, default::Default, num::NonZeroUsize, task::Waker};
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Token(NonZeroUsize);
-
-impl Token {
-    fn duplicate(&self) -> Token {
-        Token(self.0)
-    }
-}
 
 /// Data structure for managing a collection of wakers that are all interested
 /// in a single shared computation. In particular, it is designed so that only
@@ -31,6 +25,10 @@ impl Token {
 /// nevertheless unbroken chain of wakers. So long as futures take care to
 /// discard their stored tokens when dropped, the shared computation will
 /// always have a "path forward".
+///
+/// Note that, right now, this idea of a "driving waker" is considered an
+/// optimization. If there are event orderings we haven't considered that
+/// result in deadlocks, we may fall back to a more robust design.
 #[derive(Debug)]
 pub(crate) struct WakerSet {
     // Invariant: There must always be a driving waker if the waker set is
@@ -60,6 +58,7 @@ impl WakerSet {
             driving_waker: None,
         }
     }
+
     /// Add a new waker to this set. Return the token associated with this
     /// waker's entry in the set. This token should be associated with the
     /// future, and when the future is re-polled, replace_waker should be
@@ -77,25 +76,28 @@ impl WakerSet {
             .and_then(NonZeroUsize::new)
             .expect("Overflow when creating token");
 
-        self.wakers.insert(token.duplicate(), waker);
-        self.driving_waker = Some(token.duplicate());
+        self.wakers.insert(token, waker);
+        self.driving_waker = Some(token);
         token
     }
 
     /// Set a waker with an existing token in this set, replacing the existing
-    /// waker. Panics if the token is not present in the set. The waker is
-    /// passed by reference and is set with clone_from because we assume that
-    /// it comes from a Context and will need to be cloned anyway.
+    /// waker. If there is no waker in this set matching the token, it is
+    /// added; you must take care not to reuse tokens with the wrong wakersets.
     ///
     /// This waker is set as the current driving waker, on the assumption that
     /// it has just been used to poll a future.
-    pub fn replace_waker(&mut self, token: &Token, waker: &Waker) {
-        self.wakers
-            .get_mut(token)
-            .expect("Attempted to add Waker to WakerSet with an invalid token")
-            .clone_from(waker);
+    pub fn replace_waker(&mut self, token: Token, waker: &Waker) {
+        if self.next_token <= token.0 {
+            panic!("Invalid token used in replace operation: {:?}", token);
+        }
 
-        self.driving_waker = Some(token.duplicate());
+        self.wakers
+            .entry(token)
+            .and_modify(|existing| existing.clone_from(waker))
+            .or_insert_with(|| waker.clone());
+
+        self.driving_waker = Some(token);
     }
 
     /// Discard a waker from this set. If that waker was the current driving
@@ -106,14 +108,13 @@ impl WakerSet {
     /// happen at the same time we need to ensure that at least one non-dropped
     /// waker is awoken.
     pub fn discard_and_wake(&mut self, token: Token) {
-        // TODO: current we panic in replace_waker if the Token doesn't exist
-        // in the set. Should we do the same thing here?
         self.wakers.remove(&token);
+
         if self.driving_waker == Some(token) || self.driving_waker.is_none() {
             match self.wakers.iter().next() {
                 None => self.driving_waker = None,
-                Some((token, waker)) => {
-                    self.driving_waker = Some(token.duplicate());
+                Some((&token, waker)) => {
+                    self.driving_waker = Some(token);
                     waker.wake_by_ref();
                 }
             }

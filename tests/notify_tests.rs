@@ -164,6 +164,8 @@ fn test_notify_lifecycle() {
     assert_eq!(task3.poll(), Poll::Ready(Ok(3)));
 }
 
+/// Test that, when the "driving task" is dropped, one of the other tasks
+/// is awoken to continue driving the batch
 #[test]
 fn test_notify_lifecycle_drops() {
     let delay_trigger = Cell::new(None);

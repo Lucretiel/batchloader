@@ -121,7 +121,7 @@ where
 
                 return BatchFuture {
                     key_token: Some(key_token),
-                    state: state_handle,
+                    state: Some(state_handle),
                     waker_token: None,
                 };
             }
@@ -142,7 +142,7 @@ where
         BatchFuture {
             key_token: Some(key_token),
             waker_token: None,
-            state,
+            state: Some(state),
         }
     }
 }
@@ -155,7 +155,7 @@ pub struct BatchFuture<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> {
 
     // TODO: find a good way to rewrite this type so that this lint passes
     #[allow(clippy::type_complexity)]
-    state: Arc<Mutex<State<Key, Value, Error, Fut, Batcher, Delay>>>,
+    state: Option<Arc<Mutex<State<Key, Value, Error, Fut, Batcher, Delay>>>>,
 }
 
 impl<Key, Value, Error, Fut, Batcher, Delay> Future
@@ -171,7 +171,6 @@ where
     type Output = Result<Value, Error>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
-        // TODO: panic safety when resolving / polling batcher and delayer
         // TODO: find a way to make all of this into an async function. The major friction points
         // are:
         //
@@ -180,7 +179,12 @@ where
         // - We need to "leak" the KeySet to the BatchController so that new futures can add
         //   themselves to it. This is challenging if it lives in the stack of an async function.
         let unpinned = Pin::into_inner(self);
-        let mut guard = unpinned.state.lock().unwrap();
+        let mut guard = unpinned
+            .state
+            .as_mut()
+            .expect("Can't re-poll a completed BatchFuture")
+            .lock()
+            .unwrap();
 
         if let State::Accum(ref mut state) = *guard {
             // Check the delay
@@ -192,7 +196,7 @@ where
                 if let Poll::Pending = pinned_delay.poll(ctx) {
                     // This waker is now the driving waker for the Delay
                     // future. Update the wakerset.
-                    match unpinned.waker_token.as_ref() {
+                    match unpinned.waker_token {
                         Some(token) => state.wakers.replace_waker(token, ctx.waker()),
                         None => {
                             let token = state.wakers.add_waker(ctx.waker().clone());
@@ -227,7 +231,7 @@ where
                 Poll::Pending => {
                     // This is now the driving waker for the batch future.
                     // Update the wakerset.
-                    match unpinned.waker_token.as_ref() {
+                    match unpinned.waker_token {
                         Some(token) => state.wakers.replace_waker(token, ctx.waker()),
                         None => {
                             let token = state.wakers.add_waker(ctx.waker().clone());
@@ -266,16 +270,35 @@ where
             *guard = State::Done(result);
         }
 
+        // Take care to prevent mutex poisoning in these cases
         if let State::Done(Ok(ref mut values)) = *guard {
-            let token = unpinned.key_token.take().unwrap();
-            return Poll::Ready(Ok(values.take(token).unwrap()));
+            match unpinned.key_token.take() {
+                None => {
+                    drop(guard);
+                    panic!("Can't repoll a BatchFuture after it has returned Ready!");
+                }
+                Some(token) => match values.take(token) {
+                    None => {
+                        drop(guard);
+                        panic!("Unknown logic error: no value in ValueSet associated with Token");
+                    }
+                    Some(value) => {
+                        drop(guard);
+                        unpinned.state = None;
+                        return Poll::Ready(Ok(value));
+                    }
+                },
+            }
         }
 
         if let State::Done(Err(ref err)) = *guard {
-            return Poll::Ready(Err(err.clone()));
+            let err = err.clone();
+            drop(guard);
+            unpinned.state = None;
+            return Poll::Ready(Err(err));
         }
 
-        panic!("BatchFuture contained invalid state");
+        unreachable!("BatchFuture contained invalid state");
     }
 }
 
@@ -285,13 +308,13 @@ impl<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
     fn drop(&mut self) {
         // An important thing to remember when dropping a BatchFuture:
         // the shared futures used by a collection of BatchFutures are only
-        // ever being driven by a single future. Therefore, we have to ensure
+        // ever being driven by a single task. Therefore, we have to ensure
         // that another task is awoken to "take over", in case this one was
         // the driver. This logic is mostly handled by the WakerSet type.
 
         // Currently, we don't do any cleanup if the mutex is poisoned. The
         // main issue here is that we don't propogate our WakerSet state
-        // correctly; if the driving future panicks while being polled, none
+        // correctly; if the driving future panics while being polled, none
         // of the other futures will be notified. There are a few ways to
         // address this:
         // - in the short term, add an extra case here for cleanup if the
@@ -299,45 +322,45 @@ impl<Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
         //   will propogate the panics)
         // - in the medium term, add a "panicked" state and prevent the
         //   mutex from being poisoned in the first place
-        // - in the long term, move to partially lockless implementation (see
-        //   futures::Shared)
-        if let Ok(mut guard) = self.state.lock() {
-            match *guard {
-                State::Accum(ref mut state) => {
-                    if let Some(waker_token) = self.waker_token.take() {
-                        // discard_and_wake ensures that if we were the driving
-                        // future, another future will be selected to progress the
-                        // shared batch job.
-                        state.wakers.discard_and_wake(waker_token);
-                    }
+        if let Some(state) = self.state.as_mut() {
+            if let Ok(mut guard) = state.lock() {
+                match *guard {
+                    State::Accum(ref mut state) => {
+                        if let Some(waker_token) = self.waker_token.take() {
+                            // discard_and_wake ensures that if we were the driving
+                            // future, another future will be selected to progress the
+                            // shared batch job.
+                            state.wakers.discard_and_wake(waker_token);
+                        }
 
-                    if let Some(key_token) = self.key_token.take() {
-                        state.keys.discard_token(key_token);
+                        if let Some(key_token) = self.key_token.take() {
+                            state.keys.discard_token(key_token);
+                        }
                     }
-                }
-                State::Running(ref mut state) => {
-                    if let Some(waker_token) = self.waker_token.take() {
-                        // discard_and_wake ensures that if we were the driving
-                        // future, another future will be selected to progress the
-                        // shared batch job.
-                        state.wakers.discard_and_wake(waker_token);
-                    }
+                    State::Running(ref mut state) => {
+                        if let Some(waker_token) = self.waker_token.take() {
+                            // discard_and_wake ensures that if we were the driving
+                            // future, another future will be selected to progress the
+                            // shared batch job.
+                            state.wakers.discard_and_wake(waker_token);
+                        }
 
-                    // We're in the running state, which means that the KeySet is
-                    // frozen (owned by the executing future). Add our token to
-                    // the list of dropped tokens so that it can be discared from
-                    // the ValueSet when it's ready.
-                    if let Some(key_token) = self.key_token.take() {
-                        state.dropped_tokens.push(key_token)
+                        // We're in the running state, which means that the KeySet is
+                        // frozen (owned by the executing future). Add our token to
+                        // the list of dropped tokens so that it can be discared from
+                        // the ValueSet when it's ready.
+                        if let Some(key_token) = self.key_token.take() {
+                            state.dropped_tokens.push(key_token)
+                        }
                     }
-                }
-                State::Done(Ok(ref mut values)) => {
-                    // Drop our token from the ValueSet
-                    if let Some(key_token) = self.key_token.take() {
-                        values.discard(key_token);
+                    State::Done(Ok(ref mut values)) => {
+                        // Drop our token from the ValueSet
+                        if let Some(key_token) = self.key_token.take() {
+                            values.discard(key_token);
+                        }
                     }
+                    State::Done(Err(..)) => {}
                 }
-                State::Done(Err(..)) => {}
             }
         }
     }

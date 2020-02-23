@@ -11,14 +11,8 @@ use std::{
 };
 
 #[repr(transparent)]
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Token(NonZeroUsize);
-
-impl Token {
-    fn duplicate(&self) -> Self {
-        Token(self.0)
-    }
-}
 
 /// A set of keys passed into a batch loader function. Use the `keys` method
 /// to get the set of keys, all of which will be unique, so that you can
@@ -45,18 +39,6 @@ pub struct KeySet<Key: Eq + Hash> {
 }
 
 impl<Key: Eq + Hash> KeySet<Key> {
-    pub(crate) fn discard_token(&mut self, token: Token) {
-        match self.tokens.entry(token) {
-            Entry::Occupied(entry) if *entry.get() == 0 => {
-                entry.remove();
-            }
-            Entry::Occupied(mut entry) => {
-                *entry.get_mut() -= 1;
-            }
-            Entry::Vacant(_) => panic!("Attempted to remove nonexistent token from KeySet"),
-        }
-    }
-
     /// Check if there are any keys in this keyset
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -130,19 +112,31 @@ impl<Key: Eq + Hash> KeySet<Key> {
     /// associated with the key.
     pub(crate) fn add_key(&mut self, key: Key) -> Token {
         let new_token = Token(NonZeroUsize::new(self.keys.len() + 1).unwrap());
-        let token = self.keys.entry(key).or_insert(new_token).duplicate();
+        let token = *self.keys.entry(key).or_insert(new_token);
         self.tokens
-            .entry(token.duplicate())
+            .entry(token)
             .and_modify(|count| *count += 1)
             .or_insert(0);
 
         token
     }
 
+    /// Use a token to discard a previously added key from the keyset
+    pub(crate) fn discard_token(&mut self, token: Token) {
+        match self.tokens.entry(token) {
+            Entry::Occupied(entry) if *entry.get() == 0 => {
+                entry.remove();
+            }
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() -= 1;
+            }
+            Entry::Vacant(_) => panic!("Attempted to remove nonexistent token from KeySet"),
+        }
+    }
+
     /// Take the keyset out of this particular &mut self instance, replacing it
     /// with an empty set. Helper method for when the state transitions out
     /// of Accumulating.
-
     pub(crate) fn take(&mut self) -> Self {
         Self {
             keys: mem::take(&mut self.keys),
@@ -188,8 +182,9 @@ impl<Value: Clone> ValueSet<Value> {
     /// Take a value assoicated with a token out of this ValueSet. If the
     /// count of this token is > 0, the value is cloned.
     ///
-    /// This function takes a Token by move, to help ensure that that token
-    /// cannot be reused to take the same value again by accident.
+    /// This method uses the Key counters in the original KeySet to determine
+    /// the number of times the value needs to be cloned. Take care not to
+    /// reuse the same token for multiple retreivals.
     pub(crate) fn take(&mut self, token: Token) -> Option<Value> {
         // TODO: Replace this with RawEntry
         match self.values.entry(token) {
