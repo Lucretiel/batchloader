@@ -1,5 +1,6 @@
 use std::{collections::HashMap, default::Default, num::NonZeroUsize, task::Waker};
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Token(NonZeroUsize);
 
@@ -13,22 +14,21 @@ pub(crate) struct Token(NonZeroUsize);
 /// and can be used to:
 /// - replace the waker on subsequent polls
 /// - discard the waker from the wakerset.
-/// These tokens cannot be cloned or otherwise duplicated; this helps to ensure
-/// that their lifespan are correctly associated with a particular task.
 ///
 /// The WakerSet maintains the notion of the "driving waker"; this is the
 /// waker that most recently polled the relevant future. This is always the
 /// most recently added or replaced waker in the set; it is assumed that a
-/// waker will be upserted into the set, and then used to poll the underlying
-/// future. If the driving waker is discarded from the set, another can be
-/// selected as the driving waker. In this way, we create an ambiguous but
-/// nevertheless unbroken chain of wakers. So long as futures take care to
-/// discard their stored tokens when dropped, the shared computation will
-/// always have a "path forward".
+/// waker will be upserted into the set, and then immediately used to poll
+/// the underlying future. If the driving waker is discarded from the set,
+/// another can be selected as the driving waker. In this way, we create an
+/// ambiguous but nevertheless unbroken chain of wakers. So long as futures
+/// take care to discard their stored tokens when dropped, the shared
+/// computation will always have a "path forward".
 ///
 /// Note that, right now, this idea of a "driving waker" is considered an
 /// optimization. If there are event orderings we haven't considered that
-/// result in deadlocks, we may fall back to a more robust design.
+/// result in deadlocks or no woken wakers, we may fall back to a more
+/// robust design.
 #[derive(Debug)]
 pub(crate) struct WakerSet {
     // Invariant: There must always be a driving waker if the waker set is
@@ -82,22 +82,41 @@ impl WakerSet {
     }
 
     /// Set a waker with an existing token in this set, replacing the existing
-    /// waker. If there is no waker in this set matching the token, it is
-    /// added; you must take care not to reuse tokens with the wrong wakersets.
+    /// waker. Panics if there is no such token.
     ///
     /// This waker is set as the current driving waker, on the assumption that
     /// it has just been used to poll a future.
     pub fn replace_waker(&mut self, token: Token, waker: &Waker) {
-        if self.next_token <= token.0 {
-            panic!("Invalid token used in replace operation: {:?}", token);
+        let current_waker = self
+            .wakers
+            .get_mut(&token)
+            .expect("No matching token in wakerset");
+
+        if !current_waker.will_wake(&waker) {
+            current_waker.clone_from(&waker)
         }
 
-        self.wakers
-            .entry(token)
-            .and_modify(|existing| existing.clone_from(waker))
-            .or_insert_with(|| waker.clone());
-
         self.driving_waker = Some(token);
+    }
+
+    /// Wake the currently driving waker for this WakerSet. No-op if there is
+    /// no current driver, which should only happen if it's empty
+    pub fn wake_driver(&self) {
+        // note: one of the invariants of this data structure is that there is
+        // ALWAYS a driving waker if wakers is non-empty. Therefore, we can
+        // assume that if this is None, there's no need to try to create a new
+        // driving waker.
+        if let Some(ref token) = self.driving_waker {
+            self.wakers
+                .get(token)
+                .expect("Driving waker is not present in waker set; this shouldn't be possible")
+                .wake_by_ref();
+        }
+    }
+
+    /// Wake every Waker in this wakerset
+    pub fn wake_all(&self) {
+        self.wakers.values().for_each(|waker| waker.wake_by_ref());
     }
 
     /// Discard a waker from this set. If that waker was the current driving
@@ -121,33 +140,11 @@ impl WakerSet {
         }
     }
 
-    /// Wake the currently driving waker for this WakerSet. No-op if there is
-    /// no current driver.
-    pub fn wake_driver(&self) {
-        // note: one of the invariants of this data structure is that there is
-        // ALWAYS a driving waker if wakers is non-empty. Therefore, we can
-        // assume that if this is None, there's no need to try to create a new
-        // driving waker.
-        if let Some(ref token) = self.driving_waker {
-            self.wakers
-                .get(token)
-                .expect("Driving waker is somehow not present in waker set")
-                .wake_by_ref();
-        }
-    }
-
-    /// Consume this WakerSet and awaken each waker it contains.
-    pub fn wake_all(self) {
-        self.wakers
-            .into_iter()
-            .for_each(|(_token, waker)| waker.wake());
-    }
-
     /// Discard a waker from this set, then wake all remaining wakers in the
     /// set. This is used when a shared future is about to complete itself, and
     /// it wants to awaken its siblings but doesn't want to spuriously awaken
     /// itself.
-    pub fn discard_wake_all(mut self, token: Token) {
+    pub fn discard_wake_all(&mut self, token: Token) {
         self.wakers.remove(&token);
         self.wake_all()
     }

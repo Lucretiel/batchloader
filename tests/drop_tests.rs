@@ -33,11 +33,13 @@ async fn put_keys_in_rc<T: Copy + Eq + Hash>(keys: KeySet<T>) -> Result<ValueSet
 /// This test establishes a baseline behavior for our clone counters
 #[test]
 fn test_simple_drop_after_resolution() {
-    let controller = BatchController::new(BatchRules {
+    let rules = BatchRules {
         batcher: put_keys_in_rc,
         window: || future::ready(()),
         max_keys: None,
-    });
+    };
+
+    let controller = BatchController::new(&rules);
 
     let fut1 = controller.load(1);
     let fut2 = controller.load(1);
@@ -67,15 +69,14 @@ fn test_simple_drop_after_resolution() {
 #[test]
 fn test_drop_during_delay() {
     // This controller asserts that precisely the keys 1 and 2 are present in
-    // the
-    let controller = BatchController::new(BatchRules {
+    // the key set
+    let rules = BatchRules {
         batcher: |keys: KeySet<i32>| async {
             assert_eq!(keys.len(), 2);
 
-            let mut keys_vec: Vec<&i32> = keys.keys().collect();
-            keys_vec.sort();
-            assert_eq!(keys_vec[0], &1);
-            assert_eq!(keys_vec[1], &2);
+            let keys_vec: Vec<&i32> = keys.keys().collect();
+            assert!(keys_vec.contains(&&1));
+            assert!(keys_vec.contains(&&2));
 
             if false {
                 // Needed for the type annotation
@@ -86,7 +87,8 @@ fn test_drop_during_delay() {
         },
         window: || Delay::new(Duration::from_millis(10)),
         max_keys: None,
-    });
+    };
+    let controller = BatchController::new(&rules);
 
     let waker = NoOpWaker;
     let waker = waker.into_waker();

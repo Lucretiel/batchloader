@@ -1,8 +1,21 @@
 [package]
 name = "batchloader"
-version = "0.1.0"
+version = "0.5.0"
 authors = ["Nathan West <Lucretiel@gmail.com>"]
 edition = "2018"
+readme = "README.md"
+license = "MPL-2.0"
+description = "A type-safe async request batcher based on facebook's dataloader"
+repository = "https://github.com/Lucretiel/batchloader"
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

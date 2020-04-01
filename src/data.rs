@@ -30,10 +30,6 @@ pub struct KeySet<Key: Eq + Hash> {
     // specifically is the number of futures *past the first* that are awaiting
     // the key; in other words, it's the number of times the value will need
     // to be cloned.
-    //
-    // Note that Tokens are created with the len of keys, so keys should never
-    // be removed from this table. Because KeySets tend to be short lived, this
-    // shouldn't be a problem.
     keys: HashMap<Key, Token>,
     tokens: HashMap<Token, usize>,
 }
@@ -121,7 +117,9 @@ impl<Key: Eq + Hash> KeySet<Key> {
         token
     }
 
-    /// Use a token to discard a previously added key from the keyset
+    /// Use a token to discard a previously added key from the keyset. Panics
+    /// if the key is not present, because this indicates an error in the logic
+    /// somewhere.
     pub(crate) fn discard_token(&mut self, token: Token) {
         match self.tokens.entry(token) {
             Entry::Occupied(entry) if *entry.get() == 0 => {
@@ -151,6 +149,23 @@ struct ValueSetEntry<Value> {
     value: Value,
 }
 
+/// Helper struct for returning either a reference or a owned value. Basically
+/// identical to Cow, but we don't require a ToOwned bound.
+#[derive(Debug)]
+enum MaybeRef<'a, T> {
+    Owned(T),
+    Ref(&'a T),
+}
+
+impl<'a, T: Clone> MaybeRef<'a, T> {
+    fn into_owned(self) -> T {
+        match self {
+            MaybeRef::Owned(value) => value,
+            MaybeRef::Ref(value) => value.clone(),
+        }
+    }
+}
+
 /// A value set is an opaque data structure that contains the result of a batch
 /// operation. It is created with `KeySet::into_values`, and is used by the
 /// Batcher to distribute the values to the correct waiting futures.
@@ -160,25 +175,35 @@ pub struct ValueSet<Value> {
 }
 
 impl<Value> ValueSet<Value> {
+    /// Get the value associate with the token and decrement its count.
+    /// If its count is > 0, a reference is returned; otherwise the value is
+    /// removed from the set and returned by value. This function provides
+    /// the common logic between `discard` and `take`; it ensures that values
+    /// are not cloned in the discard case.
+    #[inline]
+    fn extract(&mut self, token: Token) -> Option<MaybeRef<Value>> {
+        // TODO: Replace this with RawEntry
+        match self.values.entry(token) {
+            Entry::Vacant(..) => None,
+            Entry::Occupied(entry) if entry.get().count == 0 => {
+                Some(MaybeRef::Owned(entry.remove().value))
+            }
+            Entry::Occupied(entry) => {
+                let entry = entry.into_mut();
+                entry.count -= 1;
+                Some(MaybeRef::Ref(&entry.value))
+            }
+        }
+    }
+
     /// Discard a token associated with this ValueSet without getting the
     /// value. No-op if the token isn't present.
     pub(crate) fn discard(&mut self, token: Token) {
-        // TODO: Replace this with RawEntry
-        match self.values.entry(token) {
-            Entry::Vacant(..) => {}
-            Entry::Occupied(entry) if entry.get().count == 0 => {
-                entry.remove();
-            }
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().count -= 1;
-            }
-        }
+        let _value = self.extract(token);
     }
 }
 
 impl<Value: Clone> ValueSet<Value> {
-    // TODO: deduplicate take and discard
-
     /// Take a value assoicated with a token out of this ValueSet. If the
     /// count of this token is > 0, the value is cloned.
     ///
@@ -186,16 +211,7 @@ impl<Value: Clone> ValueSet<Value> {
     /// the number of times the value needs to be cloned. Take care not to
     /// reuse the same token for multiple retreivals.
     pub(crate) fn take(&mut self, token: Token) -> Option<Value> {
-        // TODO: Replace this with RawEntry
-        match self.values.entry(token) {
-            Entry::Vacant(..) => None,
-            Entry::Occupied(entry) if entry.get().count == 0 => Some(entry.remove().value),
-            Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                entry.count -= 1;
-                Some(entry.value.clone())
-            }
-        }
+        self.extract(token).map(|value| value.into_owned())
     }
 }
 

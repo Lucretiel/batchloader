@@ -31,13 +31,14 @@ fn call_counter<'a, T, R>(
 #[test]
 fn simple_test() {
     let counter = AtomicUsize::new(0);
-    let f = call_counter(&counter, stringify);
 
-    let controller = BatchController::new(BatchRules {
+    let rules = BatchRules {
         window: move || future::ready(()),
         max_keys: None,
-        batcher: f,
-    });
+        batcher: call_counter(&counter, stringify),
+    };
+
+    let controller = BatchController::new(&rules);
 
     let fut1 = controller.load(10);
     let fut2 = controller.load(20);
@@ -53,13 +54,14 @@ fn simple_test() {
 #[test]
 fn low_key_test() {
     let counter = AtomicUsize::new(0);
-    let f = call_counter(&counter, stringify);
 
-    let controller = BatchController::new(BatchRules {
+    let rules = BatchRules {
         window: || future::ready(()),
         max_keys: NonZeroUsize::new(2),
-        batcher: f,
-    });
+        batcher: call_counter(&counter, stringify),
+    };
+
+    let controller = BatchController::new(&rules);
 
     let fut1 = controller.load(10);
     let fut2 = controller.load(20);
@@ -78,13 +80,14 @@ fn low_key_test() {
 #[test]
 fn test_duplicate_keys() {
     let counter = AtomicUsize::new(0);
-    let f = call_counter(&counter, stringify);
 
-    let controller = BatchController::new(BatchRules {
+    let rules = BatchRules {
         window: || future::ready(()),
         max_keys: None,
-        batcher: f,
-    });
+        batcher: call_counter(&counter, stringify),
+    };
+
+    let controller = BatchController::new(&rules);
 
     let fut1 = controller.load(10);
     let fut2 = controller.load(10);
@@ -111,14 +114,14 @@ fn test_duplicate_keys() {
 #[test]
 fn test_threaded() {
     let counter = AtomicUsize::new(0);
-    let f = call_counter(&counter, stringify);
 
-    let controller = BatchController::new(BatchRules {
+    let rules = BatchRules {
         window: || Delay::new(Duration::from_millis(10)),
         max_keys: None,
-        batcher: f,
-    });
+        batcher: call_counter(&counter, stringify),
+    };
 
+    let controller = BatchController::new(&rules);
     let controller_ref = &controller;
 
     let result: Vec<String> = crossbeam::scope(move |s| {
@@ -156,11 +159,13 @@ impl Wake for NoOpWaker {
 
 #[test]
 fn test_key_limit_instant_trigger() {
-    let controller = BatchController::new(BatchRules {
+    let rules = BatchRules {
         batcher: |keys: KeySet<usize>| stringify(keys),
         window: || future::pending(),
         max_keys: NonZeroUsize::new(3),
-    });
+    };
+
+    let controller = BatchController::new(&rules);
 
     let waker = NoOpWaker;
     let waker = waker.into_waker();

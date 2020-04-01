@@ -104,8 +104,7 @@ impl<F: Future + Unpin> Task<F> {
 #[test]
 fn test_notify_lifecycle() {
     let delay_trigger = Cell::new(None);
-
-    let controller = BatchController::new(BatchRules {
+    let rules = BatchRules {
         max_keys: None,
         window: || {
             let (trigger, fut) = oneshot::channel();
@@ -122,7 +121,9 @@ fn test_notify_lifecycle() {
                 Ok(keys.into_values(|key| *key))
             }
         },
-    });
+    };
+
+    let controller = BatchController::new(&rules);
 
     let mut task1 = Task::new(controller.load(1));
     let mut task2 = Task::new(controller.load(2));
@@ -169,8 +170,7 @@ fn test_notify_lifecycle() {
 #[test]
 fn test_notify_lifecycle_drops() {
     let delay_trigger = Cell::new(None);
-
-    let controller = BatchController::new(BatchRules {
+    let rules = BatchRules {
         window: || {
             let (trigger, fut) = oneshot::channel();
             let old = delay_trigger.replace(Some(trigger));
@@ -187,7 +187,9 @@ fn test_notify_lifecycle_drops() {
                 Ok(keys.into_values(|key| *key))
             }
         },
-    });
+    };
+
+    let controller = BatchController::new(&rules);
 
     let mut tasks: HashMap<i32, _> = (1..=5)
         .map(|key| (key, Task::new(controller.load(key))))
