@@ -3,7 +3,6 @@
 
 use batchloader::{BatchController, BatchRules, KeySet, ValueSet};
 use cooked_waker::{IntoWaker, Wake, WakeRef};
-use crossbeam;
 use futures::{executor, future, FutureExt};
 use futures_timer::Delay;
 use std::{

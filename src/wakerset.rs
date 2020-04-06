@@ -99,18 +99,14 @@ impl WakerSet {
         self.driving_waker = Some(token);
     }
 
-    /// Wake the currently driving waker for this WakerSet. No-op if there is
-    /// no current driver, which should only happen if it's empty
-    pub fn wake_driver(&self) {
-        // note: one of the invariants of this data structure is that there is
-        // ALWAYS a driving waker if wakers is non-empty. Therefore, we can
-        // assume that if this is None, there's no need to try to create a new
-        // driving waker.
-        if let Some(ref token) = self.driving_waker {
-            self.wakers
-                .get(token)
-                .expect("Driving waker is not present in waker set; this shouldn't be possible")
-                .wake_by_ref();
+    /// Either add a new waker (if the token is None) or replace an existing
+    /// waker (if it is not). If a new waker was added, the token is updated
+    /// in place. That waker is made the current driving waker, on the assumption
+    /// that it has just been used to poll a future.
+    pub fn update_waker(&mut self, waker: &Waker, token: &mut Option<Token>) {
+        match *token {
+            Some(token) => self.replace_waker(token, waker),
+            None => *token = Some(self.add_waker(waker.clone())),
         }
     }
 

@@ -208,8 +208,7 @@ impl<Value: Clone> ValueSet<Value> {
     /// count of this token is > 0, the value is cloned.
     ///
     /// This method uses the Key counters in the original KeySet to determine
-    /// the number of times the value needs to be cloned. Take care not to
-    /// reuse the same token for multiple retreivals.
+    /// the number of times the value needs to be cloned.
     pub(crate) fn take(&mut self, token: Token) -> Option<Value> {
         self.extract(token).map(|value| value.into_owned())
     }
