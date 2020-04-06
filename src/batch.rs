@@ -38,29 +38,55 @@ impl<'a, Key: Eq + Hash, Batcher, Delay> AccumulatingState<'a, Key, Batcher, Del
 impl<'a, Key, Batcher, Delay> Debug for AccumulatingState<'a, Key, Batcher, Delay>
 where
     Key: Debug + Hash + Eq,
-    Delay: Debug,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("AccumulatingState")
             .field("keys", &self.keys)
-            .field("batcher", &"<closure>")
-            .field("delay", &self.delay)
+            .field("batcher", &"<async fn>")
+            .field("delay", &"<Future>")
             .field("wakers", &self.wakers)
             .finish()
     }
 }
 
-#[derive(Debug)]
 struct RunningState<Fut> {
     fut: Fut,
     wakers: WakerSet,
     dropped_tokens: Vec<KeyToken>,
 }
 
+impl<Fut> Debug for RunningState<Fut> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunningState")
+            .field("fut", &"<Future>")
+            .field("wakers", &self.wakers)
+            .field("dropped_tokens", &self.dropped_tokens)
+            .finish()
+    }
+}
+
 enum State<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> {
     Accum(AccumulatingState<'a, Key, Batcher, Delay>),
     Running(RunningState<Fut>),
     Done(Result<ValueSet<Value>, Error>),
+}
+
+impl<'a, Key, Value, Error, Fut, Batcher, Delay> Debug
+    for State<'a, Key, Value, Error, Fut, Batcher, Delay>
+where
+    Key: Hash + Eq + Debug,
+    Value: Debug,
+    Error: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        use State::*;
+
+        match self {
+            Accum(state) => f.debug_tuple("State::Accum").field(state).finish(),
+            Running(state) => f.debug_tuple("State::Running").field(state).finish(),
+            Done(result) => f.debug_tuple("State::Done").field(result).finish(),
+        }
+    }
 }
 
 // TODO: impl Debug for State
@@ -86,7 +112,7 @@ where
 /// its docs for more details. Because this struct is taken by reference, it
 /// can be intialized as a const static in order to support async frameworks
 /// that require 'static Futures.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct BatchRules<Batcher, Delayer> {
     /// An async function that performs the batch work, transforming a set of
     /// keys into a set of values
@@ -102,12 +128,37 @@ pub struct BatchRules<Batcher, Delayer> {
     pub max_keys: Option<NonZeroUsize>,
 }
 
+impl<Batcher, Delayer> Debug for BatchRules<Batcher, Delayer> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BatchRules")
+            .field("batcher", &"<async fn>")
+            .field("window", &"<async fn>")
+            .field("max_keys", &self.max_keys)
+            .finish()
+    }
+}
+
 pub struct BatchController<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay, Delayer> {
     rules: &'a BatchRules<Batcher, Delayer>,
 
     // TODO: Make this a Weak ptr. Currently Weak ptr support in ArcSwap is
     // unstable.
     state: ArcSwapAny<StateHandle<'a, Key, Value, Error, Fut, Batcher, Delay>>,
+}
+
+impl<'a, Key, Value, Error, Fut, Batcher, Delay, Delayer> Debug
+    for BatchController<'a, Key, Value, Error, Fut, Batcher, Delay, Delayer>
+where
+    Key: Hash + Eq + Debug,
+    Value: Debug,
+    Error: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BatchController")
+            .field("rules", self.rules)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 impl<'a, Key, Value, Error, Fut, Batcher, Delay, Delayer>
@@ -210,6 +261,22 @@ pub struct BatchFuture<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> {
     key_token: KeyToken,
     waker_token: Option<WakerToken>,
     state: Option<StateHandle<'a, Key, Value, Error, Fut, Batcher, Delay>>,
+}
+
+impl<'a, Key, Value, Error, Fut, Batcher, Delay> Debug
+    for BatchFuture<'a, Key, Value, Error, Fut, Batcher, Delay>
+where
+    Key: Hash + Eq + Debug,
+    Value: Debug,
+    Error: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BatchFuture")
+            .field("key_token", &self.key_token)
+            .field("waker_token", &self.waker_token)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 impl<'a, Key, Value, Error, Fut, Batcher, Delay> Future
