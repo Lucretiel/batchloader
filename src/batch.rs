@@ -71,6 +71,31 @@ enum State<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> {
     Done(Result<ValueSet<Value>, Error>),
 }
 
+impl<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay>
+    State<'a, Key, Value, Error, Fut, Batcher, Delay>
+{
+    /// Call this method when a BatchFuture is being dropped to ensure its
+    /// waker is correctly discarded
+    fn discard_waker_token(&mut self, token: WakerToken) {
+        match self {
+            State::Accum(state) => state.wakers.discard_and_wake(token),
+            State::Running(state) => state.wakers.discard_and_wake(token),
+            State::Done(..) => {}
+        }
+    }
+
+    /// Call this method when a BatchFuture is being dropped to ensure its
+    /// key token is correctly discarded
+    fn discard_key_token(&mut self, token: KeyToken) {
+        match self {
+            State::Accum(state) => state.keys.discard_token(token),
+            State::Running(state) => state.dropped_tokens.push(token),
+            State::Done(Ok(values)) => values.discard(token),
+            State::Done(Err(..)) => {}
+        }
+    }
+}
+
 impl<'a, Key, Value, Error, Fut, Batcher, Delay> Debug
     for State<'a, Key, Value, Error, Fut, Batcher, Delay>
 where
@@ -199,9 +224,6 @@ where
     /// [`batchloader`] documentation for a high-level overview of running
     /// batch jobs.
     pub fn load(&self, key: Key) -> BatchFuture<'a, Key, Value, Error, Fut, Batcher, Delay> {
-        // TODO: move a lot of this functionality into a poll method somewhere.
-        // This gives us a waker to work with, which would simplify some of the
-        // edge cases.
         loop {
             let current_state = self.state.load();
 
@@ -327,8 +349,6 @@ where
         //   themselves to it. This is challenging if it lives in the stack of an async function.
         let unpinned = Pin::into_inner(self);
 
-        // Note about this mutex: it (should be) safe to use this in an async context, because
-        // the lock is released when poll returns (it isn't held between async polls).
         let mut guard = unpinned
             .state
             .as_mut()
@@ -350,8 +370,8 @@ where
                     // Check the delay
                     if let Some(ref mut delay) = state.delay {
                         // Safety: the delay is inside an arc and we don't pull it out.
-                        // It is destructed in-place at the end of this block if the
-                        // delay doesn't return Pending.
+                        // It is destructed in-place at the end of this block (or by
+                        // the BatchController) if the delay doesn't return Pending.
                         // TODO: use pin_utils
                         let pinned_delay = unsafe { Pin::new_unchecked(delay) };
                         // TODO: Panic check here. Right now we just require abort-on-panic.
@@ -475,45 +495,17 @@ impl<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
         // - in the medium term, add a "panicked" state and prevent the
         //   mutex from being poisoned in the first place
         // - alternatively, in the medium term, dispense with the notion of
-        //   a "driving future" and just awaken every task every time.
+        //   a "driving future" and just awaken every task every time. We'd
+        //   like to avoid this if possible because it over-polls the batch
+        //   job and probably results in mutex contention as well.
         // For now, we require panic=abort, meaning mutex poisoning shouldn't
         // be possible
         if let Some(state) = self.state.as_mut() {
             if let Ok(mut guard) = state.lock() {
-                match *guard {
-                    State::Accum(ref mut state) => {
-                        if let Some(waker_token) = self.waker_token.take() {
-                            // discard_and_wake ensures that if we were the driving
-                            // future, another future will be selected to progress the
-                            // shared batch job.
-                            state.wakers.discard_and_wake(waker_token);
-                        } else {
-                            // The
-                        }
-
-                        state.keys.discard_token(self.key_token);
-                    }
-                    State::Running(ref mut state) => {
-                        if let Some(waker_token) = self.waker_token.take() {
-                            // discard_and_wake ensures that if we were the driving
-                            // future, another future will be selected to progress the
-                            // shared batch job.
-                            state.wakers.discard_and_wake(waker_token);
-                        }
-
-                        // We're in the running state, which means that the KeySet is
-                        // frozen (owned by the executing future). Add our token to
-                        // the list of dropped tokens so that it can be discared from
-                        // the ValueSet when it's ready.
-                        state.dropped_tokens.push(self.key_token);
-                    }
-
-                    State::Done(Ok(ref mut values)) => {
-                        // Drop our token from the ValueSet
-                        values.discard(self.key_token);
-                    }
-                    State::Done(Err(..)) => {}
+                if let Some(waker_token) = self.waker_token.take() {
+                    guard.discard_waker_token(waker_token);
                 }
+                guard.discard_key_token(self.key_token);
             }
         }
     }

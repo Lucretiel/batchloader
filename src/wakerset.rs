@@ -149,6 +149,9 @@ impl WakerSet {
     /// We create a new driving waker immediately because if a series of drops
     /// happen at the same time we need to ensure that at least one non-dropped
     /// waker is awoken.
+    ///
+    /// TODO: consider panicing if the token isn't in our WakerSet; this
+    /// probably indicates a logic error in the library (not a user error)
     pub fn discard_and_wake(&mut self, token: Token) {
         self.wakers.remove(&token);
 
