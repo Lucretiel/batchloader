@@ -179,7 +179,29 @@ where
         }
     }
 
+    /// Add a key to the current batch, and return a Future that will be
+    /// completed with the result for that specific key. A new batch will
+    /// automatically be created if necessary.
+    ///
+    /// If that key is the *first* key to be added to the current batch, the
+    /// `window` function in this controller's `BatchRules` will be called to
+    /// create a delay controlling the window during which more keys may be
+    /// added to this batch. This delay is a future and is polled by the
+    /// future returned by this function.
+    ///
+    /// If that key is the *last* key to be added to the current batch (as
+    /// determined by the `max_key` field in the `BatchRules`), the delay
+    /// window will be cleared, which will cause the next poll to immediately
+    /// initiate the batch.
+    ///
+    /// See [`BatchFuture`] for more details on how polling the individual
+    /// futures controls the execution of the batch, and see the top level
+    /// [`batchloader`] documentation for a high-level overview of running
+    /// batch jobs.
     pub fn load(&self, key: Key) -> BatchFuture<'a, Key, Value, Error, Fut, Batcher, Delay> {
+        // TODO: move a lot of this functionality into a poll method somewhere.
+        // This gives us a waker to work with, which would simplify some of the
+        // edge cases.
         loop {
             let current_state = self.state.load();
 
@@ -217,12 +239,13 @@ where
                                 // it is dropped in-place.
                                 state.delay = None;
 
-                                // We might consider waking state.wakers, but
-                                // we assume the future that we're about to
-                                // return will immediately be polled. If it
-                                // drops without ever polling, the drop method
-                                // will ensure a different future is woken
-                                // instead.
+                                // We need to signal the current driving waker,
+                                // because the new future we're about to create
+                                // doesn't yet have a waker token, which means
+                                // if it is dropped before it is polled, it
+                                // won't signal another waker that the delay
+                                // has been changed.
+                                state.wakers.wake_driver();
                             }
 
                             drop(state_guard_result);
@@ -250,17 +273,19 @@ where
             // - If they match, that means the insertion was a success. We
             //   redo the loop to actually insert this key into the state.
             //   we do it this way so that we can use the state's mutex to
-            //   ensure the key is inserted without retries.
-            // - If they do not match, there was a replacement, which means
-            //   we need to redo the loop anyway with the new state.
+            //   ensure the key is inserted without retries (so that we don't
+            //   need cloneable keys).
+            // - If they do not match, there was a replacement in another
+            //   thread, which means we need to redo the loop anyway with
+            //   the new state.
         }
     }
 }
 
 pub struct BatchFuture<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> {
     key_token: KeyToken,
-    waker_token: Option<WakerToken>,
     state: Option<StateHandle<'a, Key, Value, Error, Fut, Batcher, Delay>>,
+    waker_token: Option<WakerToken>,
 }
 
 impl<'a, Key, Value, Error, Fut, Batcher, Delay> Debug
@@ -390,7 +415,7 @@ where
 
                     // Now that we have a result, signal all the waiting futures to
                     // wake up so they can get their results.
-                    match unpinned.waker_token.take() {
+                    match unpinned.waker_token {
                         // We're about to grab our result, so we don't need to wake
                         // ourself. It's also entirely possible that we never had a token
                         // to begin with.
@@ -462,6 +487,8 @@ impl<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay> Drop
                             // future, another future will be selected to progress the
                             // shared batch job.
                             state.wakers.discard_and_wake(waker_token);
+                        } else {
+                            // The
                         }
 
                         state.keys.discard_token(self.key_token);

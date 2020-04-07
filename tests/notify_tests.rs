@@ -1,7 +1,7 @@
 //! These tests ensure that, when a driving future is dropped, another future
 //! is notified.
 
-use batchloader::{BatchController, BatchRules, KeySet};
+use batchloader::{BatchController, BatchRules, KeySet, ValueSet};
 use cooked_waker::{IntoWaker, Wake, WakeRef};
 use futures::{channel::oneshot, FutureExt};
 use std::{
@@ -101,6 +101,14 @@ impl<F: Future + Unpin> Task<F> {
     }
 }
 
+// A function that skips once, then copies its KeySet to its ValueSet
+async fn skip_then_copy(keys: KeySet<i32>) -> Result<ValueSet<i32>, ()> {
+    let skipper = Skipper::new(1);
+    skipper.await;
+
+    Ok(keys.into_values(|&key| key))
+}
+
 #[test]
 fn test_notify_lifecycle() {
     let delay_trigger = Cell::new(None);
@@ -112,15 +120,7 @@ fn test_notify_lifecycle() {
             assert!(old.is_none());
             fut.map(|_| ())
         },
-        batcher: |keys: KeySet<i32>| async {
-            Skipper::new(1).await;
-
-            if false {
-                Err(())
-            } else {
-                Ok(keys.into_values(|key| *key))
-            }
-        },
+        batcher: skip_then_copy,
     };
 
     let controller = BatchController::new(&rules);
@@ -178,15 +178,7 @@ fn test_notify_lifecycle_drops() {
             fut.map(|_| ())
         },
         max_keys: None,
-        batcher: |keys: KeySet<i32>| async {
-            Skipper::new(1).await;
-
-            if false {
-                Err(())
-            } else {
-                Ok(keys.into_values(|key| *key))
-            }
-        },
+        batcher: skip_then_copy,
     };
 
     let controller = BatchController::new(&rules);

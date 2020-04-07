@@ -4,6 +4,29 @@ use std::{collections::HashMap, default::Default, num::NonZeroUsize, task::Waker
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Token(NonZeroUsize);
 
+impl Token {
+    /// Make a brand new token from scratch. This should only be used when
+    /// initializing a new Wakerset.
+    fn new() -> Self {
+        Token(NonZeroUsize::new(1).unwrap())
+    }
+    /// Return a copy of this token and increment the inner ID
+    fn next_token(&mut self) -> Token {
+        let current = *self;
+        // Interstingly, we could use wrapping_add and rely on the
+        // NonZero check to panic
+        *self = self
+            .0
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .map(Token)
+            .expect("Overflow when creating a Waker token");
+
+        current
+    }
+}
+
 /// Data structure for managing a collection of wakers that are all interested
 /// in a single shared computation. In particular, it is designed so that only
 /// a single task needs to actually do the work of driving the future to
@@ -17,9 +40,9 @@ pub(crate) struct Token(NonZeroUsize);
 ///
 /// The WakerSet maintains the notion of the "driving waker"; this is the
 /// waker that most recently polled the relevant future. This is always the
-/// most recently added or replaced waker in the set; it is assumed that a
-/// waker will be upserted into the set, and then immediately used to poll
-/// the underlying future. If the driving waker is discarded from the set,
+/// most recently added or replaced waker in the set. This design is such
+/// that, after a shared future is polled, that context should be immediately
+/// added to this wakerset. If the driving waker is discarded from the set,
 /// another can be selected as the driving waker. In this way, we create an
 /// ambiguous but nevertheless unbroken chain of wakers. So long as futures
 /// take care to discard their stored tokens when dropped, the shared
@@ -44,8 +67,8 @@ pub(crate) struct WakerSet {
 
     // Tokens are an ever-increasing integer. We assume that WakerSets are
     // relatively short-lived and that there's no chance of running out of
-    // these.
-    next_token: NonZeroUsize,
+    // these. We use a nonzero usize so that we can have a cheap Option<Token>
+    next_token: Token,
 }
 
 impl WakerSet {
@@ -54,7 +77,7 @@ impl WakerSet {
     pub fn new() -> Self {
         Self {
             wakers: HashMap::new(),
-            next_token: NonZeroUsize::new(1).unwrap(),
+            next_token: Token::new(),
             driving_waker: None,
         }
     }
@@ -68,14 +91,7 @@ impl WakerSet {
     /// it has just been used to poll a future.
     #[must_use]
     pub fn add_waker(&mut self, waker: Waker) -> Token {
-        let token = Token(self.next_token);
-        self.next_token = self
-            .next_token
-            .get()
-            .checked_add(1)
-            .and_then(NonZeroUsize::new)
-            .expect("Overflow when creating token");
-
+        let token = self.next_token.next_token();
         self.wakers.insert(token, waker);
         self.driving_waker = Some(token);
         token
@@ -107,6 +123,17 @@ impl WakerSet {
         match *token {
             Some(token) => self.replace_waker(token, waker),
             None => *token = Some(self.add_waker(waker.clone())),
+        }
+    }
+
+    /// Wake the current driving waker, if it exists. No-op if there are no
+    /// wakers in the set.
+    pub fn wake_driver(&self) {
+        if let Some(driver) = self.driving_waker {
+            self.wakers
+                .get(&driver)
+                .expect("Error: driving waker not present in Wakerset")
+                .wake_by_ref();
         }
     }
 

@@ -68,23 +68,24 @@ fn test_simple_drop_after_resolution() {
 
 #[test]
 fn test_drop_during_delay() {
-    // This controller asserts that precisely the keys 1 and 2 are present in
-    // the key set
+    // This batch function asserts that precisely the keys 1 and 2 are present
+    // in the key set, then returns a valueset just containing those keys
+    async fn one_and_two(keys: KeySet<i32>) -> Result<ValueSet<i32>, ()> {
+        assert_eq!(keys.len(), 2);
+
+        let keys_vec: Vec<&i32> = keys.keys().collect();
+        assert!(keys_vec.contains(&&1));
+        assert!(keys_vec.contains(&&2));
+
+        if false {
+            return Err(());
+        }
+
+        Ok(keys.into_values(|&key| key))
+    }
+
     let rules = BatchRules {
-        batcher: |keys: KeySet<i32>| async {
-            assert_eq!(keys.len(), 2);
-
-            let keys_vec: Vec<&i32> = keys.keys().collect();
-            assert!(keys_vec.contains(&&1));
-            assert!(keys_vec.contains(&&2));
-
-            if false {
-                // Needed for the type annotation
-                Err(())
-            } else {
-                Ok(keys.into_values(|key| *key))
-            }
-        },
+        batcher: one_and_two,
         window: || Delay::new(Duration::from_millis(10)),
         max_keys: None,
     };
