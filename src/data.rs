@@ -1,7 +1,8 @@
 //! Data structures for passing keys and values into and out of a BatchState.
 // TODO: remove Copy + Clone from Token, so that we can use ownership semantics
 // to enforce that each token can be used for at-most one extraction from a
-// ValueSet
+// ValueSet. There's no way to prevent a Token from being used on the wrong
+// ValueSet, which is why for now we don't worry about it.
 
 use std::{
     borrow::Borrow,
@@ -9,19 +10,41 @@ use std::{
     error::Error,
     fmt::{Debug, Display},
     hash::Hash,
+    iter::FusedIterator,
     mem,
     num::NonZeroUsize,
 };
 
+/// A token represents the entry of a key into a KetSet, and is used to extract
+/// the associated value from the associated ValueSet. It cannot be externally
+/// created / cloned / duplicated; this helps ensure that each Token is only
+/// used once (either to remove a key from a KeySet or to get a value from a
+/// ValueSet).
+///
+/// It is optimized such that Option<Token> has no overhead.
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Token(NonZeroUsize);
+
+impl Token {
+    /// Internal method for duplicating tokens.
+    fn copy(&self) -> Self {
+        Token(self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KeySetEntry<'a, Key> {
+    key: &'a Key,
+    token: &'a Token,
+    count: usize,
+}
 
 /// A set of keys passed into a batch loader function. Use the `keys` method
 /// to get the set of keys, all of which will be unique, so that you can
-/// execute your request. Then, use the `into_key_values` function to
-/// transform your response data into a ValueSet, which is handed back to the
-/// batch loader.
+/// execute your request. Then, use the `into_key_values` or
+/// `values_from_iter` method to transform your response data into a ValueSet,
+/// which is handed back to the batch loader.
 #[derive(Debug)]
 pub struct KeySet<Key: Eq + Hash> {
     // In order to not require cloneable keys, this structure associates each
@@ -33,11 +56,70 @@ pub struct KeySet<Key: Eq + Hash> {
     // specifically is the number of futures *past the first* that are awaiting
     // the key; in other words, it's the number of times the value will need
     // to be cloned.
+    //
+    // Because there's no fast-mapping of Key -> Token, and because it makes
+    // token generation easier, we never remove items from the `keys` map.
+    // KeySets are assumed to be relatively short-lived, so this isn't a big
+    // deal.
     keys: HashMap<Key, Token>,
     tokens: HashMap<Token, usize>,
 }
 
 impl<Key: Eq + Hash> KeySet<Key> {
+    pub(crate) fn new() -> Self {
+        Self {
+            keys: HashMap::new(),
+            tokens: HashMap::new(),
+        }
+    }
+
+    /// Add a key to this KeySet, and return the token associated with that
+    /// key. This token can then be used to pull a value out of the ValueSet
+    /// associated with the key.
+    pub(crate) fn add_key(&mut self, key: Key) -> Token {
+        let new_token = Token(NonZeroUsize::new(self.keys.len().saturating_add(1)).unwrap());
+        let token = self.keys.entry(key).or_insert(new_token).copy();
+
+        self.tokens
+            .entry(token.copy())
+            .and_modify(|count| *count += 1)
+            .or_insert(0);
+
+        token
+    }
+
+    /// Use a token to discard a previously added key from the keyset. Panics
+    /// if the key is not present, because this indicates an error in the logic
+    /// somewhere.
+    pub(crate) fn discard_token(&mut self, token: Token) {
+        match self.tokens.entry(token) {
+            Entry::Occupied(entry) if *entry.get() == 0 => {
+                entry.remove();
+            }
+            Entry::Occupied(entry) => {
+                *entry.into_mut() -= 1;
+            }
+            Entry::Vacant(_) => panic!("Attempted to remove nonexistent token from KeySet"),
+        }
+    }
+
+    /// Take the keyset out of this particular &mut self instance, replacing it
+    /// with an empty set. Helper method for when the state transitions out
+    /// of Accumulating.
+    pub(crate) fn take(&mut self) -> Self {
+        Self {
+            keys: mem::take(&mut self.keys),
+            tokens: mem::take(&mut self.tokens),
+        }
+    }
+
+    fn entries(&self) -> impl Iterator<Item = KeySetEntry<'_, Key>> + Clone + FusedIterator {
+        self.keys.iter().filter_map(move |(key, token)| {
+            let count = *self.tokens.get(token)?;
+            Some(KeySetEntry { key, token, count })
+        })
+    }
+
     /// Check if there are any keys in this keyset
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -56,13 +138,8 @@ impl<Key: Eq + Hash> KeySet<Key> {
     /// - Unique
     /// - Between 1 and the configured max_keys of the related BatchRules
     /// - In an arbitrary order
-    pub fn keys(&self) -> impl Iterator<Item = &Key> + Clone {
-        let tokens = &self.tokens;
-
-        self.keys
-            .iter()
-            .filter(move |(_key, token)| tokens.contains_key(token))
-            .map(|(key, _token)| key)
+    pub fn keys(&self) -> impl Iterator<Item = &Key> + Clone + FusedIterator {
+        self.entries().map(|entry| entry.key)
     }
 
     /// Look up if a key is present in this KeySet.
@@ -71,10 +148,10 @@ impl<Key: Eq + Hash> KeySet<Key> {
         Q: Hash + Eq,
         Key: Borrow<Q>,
     {
-        match self.keys.get(key) {
-            Some(token) => self.tokens.contains_key(token),
-            None => false,
-        }
+        self.keys
+            .get(key)
+            .map(|token| self.tokens.contains_key(token))
+            .unwrap_or(false)
     }
 
     /// After you've completed your batch job, use this method to pair each
@@ -83,38 +160,25 @@ impl<Key: Eq + Hash> KeySet<Key> {
     /// to produce the `ValueSet` that will be used to distribute values to
     /// the individual futures. If you don't have an easy `get_value`function—
     /// for example, if your data is in an unordered `Vec`— consider using the
-    /// [`values_from_iter`] function instead.
+    /// `values_from_iter` function instead.
     pub fn into_values<'a, Value>(
         &'a self,
         mut get_value: impl FnMut(&'a Key) -> Value,
     ) -> ValueSet<Value> {
-        #[derive(Debug)]
-        enum Never {}
-
-        self.try_into_values(move |key| -> Result<Value, Never> { Ok(get_value(key)) })
-            .unwrap()
-    }
-
-    /// Fallible version of `into_values`. Same as `into_values`, but will return
-    /// an error the first time `get_value` returns an error.
-    pub fn try_into_values<'a, Value, Error>(
-        &'a self,
-        mut get_value: impl FnMut(&'a Key) -> Result<Value, Error>,
-    ) -> Result<ValueSet<Value>, Error> {
-        let result: Result<HashMap<Token, ValueSetEntry<Value>>, Error> = self
-            .keys
-            .iter()
-            .filter_map(move |(key, token)| {
-                let count = self.tokens.get(token)?;
-                Some((key, *token, *count))
-            })
-            .map(move |(key, token, count)| {
-                let value = get_value(key)?;
-                Ok((token, ValueSetEntry { value, count }))
+        let values = self
+            .entries()
+            .map(move |entry| {
+                (
+                    entry.token.copy(),
+                    ValueSetEntry {
+                        count: entry.count,
+                        value: get_value(entry.key),
+                    },
+                )
             })
             .collect();
 
-        result.map(move |values| ValueSet { values })
+        ValueSet { values }
     }
 
     /// After you've completed your request, use this method to turn your
@@ -144,21 +208,21 @@ impl<Key: Eq + Hash> KeySet<Key> {
         Key: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let KeySet { keys, tokens } = self;
-        let mut values: HashMap<Token, ValueSetEntry<Value>> = HashMap::with_capacity(tokens.len());
+        let mut values: HashMap<Token, ValueSetEntry<Value>> =
+            HashMap::with_capacity(self.tokens.len());
 
         for entry in entries {
             let key = entry.get_key();
 
-            match keys.get(key) {
+            match self.keys.get(key) {
                 None => return Err(IntoValuesError::UnrecognizedKey(entry)),
-                Some(&token) => match values.entry(token) {
+                Some(token) => match values.entry(token.copy()) {
                     Entry::Occupied(slot) => match on_dup {
                         OnDuplicate::Replace => slot.into_mut().value = entry.into_value(),
                         OnDuplicate::Skip => continue,
                         OnDuplicate::Error => return Err(IntoValuesError::DuplicateKey(entry)),
                     },
-                    Entry::Vacant(slot) => match tokens.get(&token) {
+                    Entry::Vacant(slot) => match self.tokens.get(&token) {
                         None => return Err(IntoValuesError::UnrecognizedKey(entry)),
                         Some(&count) => {
                             slot.insert(ValueSetEntry {
@@ -171,59 +235,14 @@ impl<Key: Eq + Hash> KeySet<Key> {
             }
         }
 
-        for (key, token) in keys {
-            if !values.contains_key(&token) {
-                return Err(IntoValuesError::MissingKey(key));
-            }
+        if let Some(missing) = self
+            .entries()
+            .find(|entry| !values.contains_key(entry.token))
+        {
+            return Err(IntoValuesError::MissingKey(missing.key));
         }
 
         Ok(ValueSet { values })
-    }
-
-    pub(crate) fn new() -> Self {
-        Self {
-            keys: HashMap::new(),
-            tokens: HashMap::new(),
-        }
-    }
-
-    /// Add a key to this KeySet, and return the token associated with that
-    /// key. This token can then be used to pull a value out of the ValueSet
-    /// associated with the key.
-    pub(crate) fn add_key(&mut self, key: Key) -> Token {
-        let new_token = Token(NonZeroUsize::new(self.keys.len() + 1).unwrap());
-        let token = *self.keys.entry(key).or_insert(new_token);
-        self.tokens
-            .entry(token)
-            .and_modify(|count| *count += 1)
-            .or_insert(0);
-
-        token
-    }
-
-    /// Use a token to discard a previously added key from the keyset. Panics
-    /// if the key is not present, because this indicates an error in the logic
-    /// somewhere.
-    pub(crate) fn discard_token(&mut self, token: Token) {
-        match self.tokens.entry(token) {
-            Entry::Occupied(entry) if *entry.get() == 0 => {
-                entry.remove();
-            }
-            Entry::Occupied(mut entry) => {
-                *entry.get_mut() -= 1;
-            }
-            Entry::Vacant(_) => panic!("Attempted to remove nonexistent token from KeySet"),
-        }
-    }
-
-    /// Take the keyset out of this particular &mut self instance, replacing it
-    /// with an empty set. Helper method for when the state transitions out
-    /// of Accumulating.
-    pub(crate) fn take(&mut self) -> Self {
-        Self {
-            keys: mem::take(&mut self.keys),
-            tokens: mem::take(&mut self.tokens),
-        }
     }
 }
 
@@ -272,7 +291,7 @@ where
     }
 }
 
-/// This enum controls how [`ValueSet::values_from_iter`] method handles
+/// This enum controls how `ValueSet::values_from_iter` method handles
 /// duplicate keys. See that method's documentation for details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnDuplicate {
@@ -284,7 +303,7 @@ pub enum OnDuplicate {
     Error,
 }
 
-/// If the `entries` input data to [`ValueSet::values_from_iter`] was not
+/// If the `entries` input data to `ValueSet::values_from_iter` was not
 /// well-formed, this error is returned indicating the specific error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntoValuesError<'a, Entry, Key> {
@@ -369,9 +388,12 @@ impl<Value> ValueSet<Value> {
     }
 
     /// Discard a token associated with this ValueSet without getting the
-    /// value. No-op if the token isn't present.
+    /// value. Panics if the token isn't present (because this indicates a
+    /// logic error somewhere in the design of BatchLoader)
     pub(crate) fn discard(&mut self, token: Token) {
-        let _value = self.extract(token);
+        let _value = self
+            .extract(token)
+            .expect("Tried to discard a token with no matching entry");
     }
 }
 
@@ -381,8 +403,13 @@ impl<Value: Clone> ValueSet<Value> {
     ///
     /// This method uses the Key counters in the original KeySet to determine
     /// the number of times the value needs to be cloned.
-    pub(crate) fn take(&mut self, token: Token) -> Option<Value> {
-        self.extract(token).map(|value| value.into_owned())
+    ///
+    /// Panics if the token isn't present (because this indicates a logic
+    /// error somewhere in the design of BatchLoader)
+    pub(crate) fn take(&mut self, token: Token) -> Value {
+        self.extract(token)
+            .map(|value| value.into_owned())
+            .expect("Tried to retrieve a value associate with an absent Token")
     }
 }
 

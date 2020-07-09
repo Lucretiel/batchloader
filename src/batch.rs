@@ -167,7 +167,7 @@ pub struct BatchController<'a, Key: Hash + Eq, Value, Error, Fut, Batcher, Delay
     rules: &'a BatchRules<Batcher, Delayer>,
 
     // TODO: Make this a Weak ptr. Currently Weak ptr support in ArcSwap is
-    // unstable.
+    // unstable, and atomic weaks are a bit more awkward to work with,
     state: ArcSwapAny<StateHandle<'a, Key, Value, Error, Fut, Batcher, Delay>>,
 }
 
@@ -221,7 +221,7 @@ where
     ///
     /// See [`BatchFuture`] for more details on how polling the individual
     /// futures controls the execution of the batch, and see the top level
-    /// [`batchloader`] documentation for a high-level overview of running
+    /// [`batchloader`][crate] documentation for a high-level overview of running
     /// batch jobs.
     pub fn load(&self, key: Key) -> BatchFuture<'a, Key, Value, Error, Fut, Batcher, Delay> {
         loop {
@@ -339,6 +339,12 @@ where
     type Output = Result<Value, Error>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
+        // TODO: see if we can move this to a more lock-free design; see
+        // futures::Shared for inspiration. This would allow us to move away
+        // from the "driving future" concept, because several simultaneous polls
+        // would all skip doing any work with only one actually accessing the
+        // critical section.
+
         // TODO: find a way to make all of this into an async function. The major friction points
         // are:
         //
@@ -363,7 +369,7 @@ where
         // if state3 => { return ready }
         //
         // However, it's preferable to have the compile-time guarantees of exhaustiveness, so we
-        // use this loop instead.
+        // use this loop over a match instead.
         loop {
             match *guard {
                 State::Accum(ref mut state) => {

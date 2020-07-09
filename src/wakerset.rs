@@ -1,7 +1,7 @@
 use std::{collections::HashMap, default::Default, num::NonZeroUsize, task::Waker};
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Token(NonZeroUsize);
 
 impl Token {
@@ -10,10 +10,17 @@ impl Token {
     fn new() -> Self {
         Token(NonZeroUsize::new(1).unwrap())
     }
-    /// Return a copy of this token and increment the inner ID
+
+    fn copy(&self) -> Self {
+        Token(self.0)
+    }
+
+    /// Use this token as a generator; return the next token in the sequence
+    /// and increment this one.
     fn next_token(&mut self) -> Token {
-        let current = *self;
-        // Interstingly, we could use wrapping_add and rely on the
+        let current = self.copy();
+
+        // Interestingly, we could use wrapping_add and rely on the
         // NonZero check to panic
         *self = self
             .0
@@ -102,17 +109,17 @@ impl WakerSet {
     ///
     /// This waker is set as the current driving waker, on the assumption that
     /// it has just been used to poll a future.
-    pub fn replace_waker(&mut self, token: Token, waker: &Waker) {
+    pub fn replace_waker(&mut self, token: &Token, waker: &Waker) {
         let current_waker = self
             .wakers
             .get_mut(&token)
             .expect("No matching token in wakerset");
 
         if !current_waker.will_wake(&waker) {
-            current_waker.clone_from(&waker)
+            current_waker.clone_from(waker)
         }
 
-        self.driving_waker = Some(token);
+        self.driving_waker = Some(token.copy());
     }
 
     /// Either add a new waker (if the token is None) or replace an existing
@@ -150,7 +157,7 @@ impl WakerSet {
     /// happen at the same time we need to ensure that at least one non-dropped
     /// waker is awoken.
     ///
-    /// TODO: consider panicing if the token isn't in our WakerSet; this
+    /// TODO: consider panicking if the token isn't in our WakerSet; this
     /// probably indicates a logic error in the library (not a user error)
     pub fn discard_and_wake(&mut self, token: Token) {
         self.wakers.remove(&token);
